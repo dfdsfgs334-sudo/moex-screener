@@ -426,7 +426,9 @@ def parse_args():
                    help="кулдаун повторного алерта по тикеру/направлению, мин (по умолч. 15)")
     p.add_argument("--escalate", type=float, default=1.0,
                    help="в кулдауне алертить снова, если движение выросло ещё на N %% (по умолч. 1)")
-    p.add_argument("--no-day", action="store_true", help="выключить дневные алерты к клирингу")
+    p.add_argument("--day", action="store_true",
+                   default=os.getenv("DAY_ALERTS", "0").lower() in ("1", "true", "yes"),
+                   help="включить дневные алерты к клирингу (по умолч. выкл; env DAY_ALERTS=1)")
     p.add_argument("--day-step", type=float, default=1.0,
                    help="шаг дневных уровней после порога, %% (2,3,4...; по умолч. 1)")
     p.add_argument("--min-trades", type=int, default=int(os.getenv("MIN_TRADES", 30)),
@@ -462,7 +464,7 @@ def main():
 
     client = MoexClient(os.getenv("MOEX_LOGIN"), os.getenv("MOEX_PASSWORD"))
     det = SpikeDetector(args.threshold, int(args.window * 60), int(args.cooldown * 60),
-                        args.escalate, not args.no_day, args.day_step)
+                        args.escalate, args.day, args.day_step)
     only = {x.strip().upper() for x in args.only.split(",") if x.strip()}
     excl = {x.strip().upper() for x in args.exclude.split(",") if x.strip()}
 
@@ -486,7 +488,9 @@ def main():
                      "val": fmt_val(qs[k].val_today)} for k, _ in items[:args.top]]
         with lock:
             return {"status": status_line, "threshold": args.threshold, "window": args.window,
-                    "alerts": [{"time": a.ts.strftime("%d.%m %H:%M:%S"), "kind": a.kind,
+                    "alerts": [{"time": a.ts.strftime("%d.%m %H:%M:%S"), "kind": ((f"прострел {a.window_s // 60}м" if a.window_s >= 60 else "прострел <1м")
+                                         if a.kind == "IMPULSE"
+                                         else "к клирингу"),
                                 "secid": a.secid, "pct": a.pct, "price": a.price,
                                 "ref": a.ref_price} for a in list(feed)[:100]],
                     "window_top": top(wm), "day_top": top(dm)}
