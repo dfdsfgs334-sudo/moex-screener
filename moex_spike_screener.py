@@ -265,15 +265,28 @@ class Notifier:
                 csv.writer(f).writerow(["time", "kind", "secid", "name", "dir", "pct",
                                         "price", "ref_price", "window_s", "day_pct", "val_today"])
 
-    def send_text(self, text: str):
+    def send_text(self, text: str) -> bool:
         if not (self.tg_token and self.tg_chat):
-            return
+            return False
         try:
-            self.s.post(f"https://api.telegram.org/bot{self.tg_token}/sendMessage",
-                        data={"chat_id": self.tg_chat, "text": text, "parse_mode": "HTML",
-                              "disable_web_page_preview": True}, timeout=10)
+            r = self.s.post(f"https://api.telegram.org/bot{self.tg_token.strip()}/sendMessage",
+                            data={"chat_id": self.tg_chat.strip(), "text": text,
+                                  "parse_mode": "HTML", "disable_web_page_preview": True},
+                            timeout=10)
+            if r.ok:
+                return True
+            try:
+                desc = r.json().get("description", r.text)
+            except ValueError:
+                desc = r.text[:200]
+            hint = {401: "неверный TG_TOKEN",
+                    400: "неверный TG_CHAT_ID или у бота не нажат Start",
+                    403: "бот заблокирован или не добавлен в чат"}.get(r.status_code, "")
+            print(f"[tg] Telegram ответил {r.status_code}: {desc} {('— ' + hint) if hint else ''}",
+                  file=sys.stderr, flush=True)
         except requests.RequestException as e:
-            print(f"[tg] ошибка отправки: {e}", file=sys.stderr)
+            print(f"[tg] ошибка сети: {e}", file=sys.stderr, flush=True)
+        return False
 
     def send(self, a: Alert):
         if self.beep:
@@ -286,14 +299,7 @@ class Notifier:
                                         a.ref_price, a.window_s,
                                         "" if a.day_pct is None else f"{a.day_pct:.3f}",
                                         a.val_today])
-        if self.tg_token and self.tg_chat:
-            try:
-                self.s.post(f"https://api.telegram.org/bot{self.tg_token}/sendMessage",
-                            data={"chat_id": self.tg_chat, "text": fmt_alert(a, html=True),
-                                  "parse_mode": "HTML", "disable_web_page_preview": True},
-                            timeout=10)
-            except requests.RequestException as e:
-                print(f"[tg] ошибка отправки: {e}", file=sys.stderr)
+        self.send_text(fmt_alert(a, html=True))
 
 
 # ─────────────────────────── UI ───────────────────────────
@@ -508,7 +514,7 @@ def main():
             errors = 0
         except Exception as e:  # сеть/биржа моргнула — не падаем
             errors += 1
-            return f"ошибка ISS ({errors}): {e}"
+            return f"ошибка ISS ({errors}): {type(e).__name__}: {str(e)[:200]}"
         if args.front:
             data = front_month_only(data)
         now = time.time()
@@ -548,7 +554,13 @@ def main():
 
     print(f"Старт: порог ±{args.threshold}%, окно {args.window:g} мин, опрос {args.interval:g}с. "
           f"Telegram: {'вкл' if os.getenv('TG_TOKEN') and os.getenv('TG_CHAT_ID') else 'выкл'}. "
-          "Ctrl+C — выход.")
+          "Ctrl+C — выход.", flush=True)
+    if notifier.tg_token and notifier.tg_chat:
+        ok = notifier.send_text("🔌 Скринер MOEX стартует, подключаюсь к бирже…")
+        print(f"[tg] тестовое сообщение: {'отправлено' if ok else 'НЕ отправлено, см. ошибку выше'}",
+              flush=True)
+    else:
+        print("[tg] TG_TOKEN или TG_CHAT_ID не заданы — алерты в Telegram не пойдут", flush=True)
     try:
         if use_rich:
             with Live(console=console, screen=True, auto_refresh=False) as live:
