@@ -79,11 +79,12 @@ class MoexClient:
         """secid -> {name, asset, num_trades}"""
         js = self.get("securities.json", {
             "iss.only": "securities,marketdata",
-            "securities.columns": "SECID,SHORTNAME,ASSETCODE",
+            "securities.columns": "SECID,SHORTNAME,ASSETCODE,PREVOPENPOSITION",
             "marketdata.columns": "SECID,NUMTRADES",
         })
         out = {r["SECID"]: {"name": r.get("SHORTNAME") or r["SECID"],
-                            "asset": r.get("ASSETCODE") or "", "num_trades": 0}
+                            "asset": r.get("ASSETCODE") or "", "num_trades": 0,
+                            "prev_oi": int(r.get("PREVOPENPOSITION") or 0)}
                for r in iss_rows(js, "securities")}
         for r in iss_rows(js, "marketdata"):
             if r["SECID"] in out:
@@ -240,6 +241,25 @@ class Notifier:
         return False
 
     def send(self, a: Alert):
+        """Неблокирующая отправка: алерт уходит в очередь фонового потока."""
+        if not hasattr(self, "_q"):
+            import queue
+            self._q = queue.Queue(maxsize=1000)
+            threading.Thread(target=self._worker, daemon=True, name="notifier").start()
+        try:
+            self._q.put_nowait(a)
+        except Exception:
+            log("[tg] очередь алертов переполнена, алерт пропущен")
+
+    def _worker(self):
+        while True:
+            a = self._q.get()
+            try:
+                self._deliver(a)
+            except Exception as e:
+                log(f"[tg] ошибка доставки: {e}")
+
+    def _deliver(self, a: Alert):
         if self.csv_path:
             with open(self.csv_path, "a", newline="", encoding="utf-8") as f:
                 csv.writer(f).writerow([a.exch_time, a.seen.isoformat(timespec="seconds"), a.secid,
@@ -337,6 +357,7 @@ class Screener:
         self.rate = deque(maxlen=600)      # (time, trades) для сделок/мин
         self.last_exch = "—"
         self.last_err = ""
+        self.source = "MOEX ISS, задержка ~15 мин"
         self.lock = threading.Lock()
 
     # --- фильтры ---
@@ -382,19 +403,24 @@ class Screener:
             secid, price, systime = r.get("SECID"), r.get("PRICE"), r.get("SYSTIME")
             if not secid or not price or not systime:
                 continue
-            self.last_exch = systime[11:]
-            ts = parse_ts(systime)
-            hit = self.det.on_trade(secid, ts, float(price))
-            if hit and self.allowed(secid):
-                d, pct, ref = hit
-                a = Alert(systime[11:], datetime.now(), secid,
-                          self.instr.get(secid, {}).get("name", secid), d, pct, float(price),
-                          ref, int(r.get("QUANTITY") or 0), r.get("BUYSELL") or "", now - ts)
-                with self.lock:
-                    self.alerts.appendleft(a)
-                log(fmt_alert(a).replace("\n", " | "))
-                self.notifier.send(a)
+            self.handle_trade(secid, parse_ts(systime), float(price),
+                              int(r.get("QUANTITY") or 0), r.get("BUYSELL") or "")
         self.rate.append((now, len(rows)))
+
+    def handle_trade(self, secid: str, ts: float, price: float, qty: int, side: str,
+                     can_alert: bool = True):
+        """Общая обработка сделки для любого источника (ISS или Finam)."""
+        self.last_exch = datetime.fromtimestamp(ts, MSK).strftime("%H:%M:%S")
+        hit = self.det.on_trade(secid, ts, price)
+        if hit and can_alert and self.allowed(secid):
+            d, pct, ref = hit
+            a = Alert(self.last_exch, datetime.now(), secid,
+                      self.instr.get(secid, {}).get("name", secid), d, pct, price,
+                      ref, qty, side, time.time() - ts)
+            with self.lock:
+                self.alerts.appendleft(a)
+            log(fmt_alert(a).replace("\n", " | "))
+            self.notifier.send(a)
 
     def tick(self) -> bool:
         """Один опрос. True — есть ещё данные, опросить сразу."""
@@ -421,7 +447,7 @@ class Screener:
             alerts = list(self.alerts)[:150]
         now = time.time()
         per_min = sum(n for t, n in list(self.rate) if now - t < 60)
-        status = [("биржа", self.last_exch),
+        status = [("источник", self.source), ("биржа", self.last_exch),
                   ("сделок обработано", f"{self.processed:,}".replace(",", " ")),
                   ("сделок/мин", str(per_min)), ("порог", f"±{self.a.threshold}%"),
                   ("Telegram", "вкл" if self.notifier.enabled else "выкл"),
@@ -511,8 +537,23 @@ def main():
     scr = Screener(args, client, notifier)
     if os.getenv("PORT"):
         start_web(int(os.getenv("PORT")), scr.state)
+    secret = (os.getenv("FINAM_SECRET") or "").strip()
     try:
-        scr.run()
+        if secret:
+            from finam_source import FinamFeed
+            scr.source = "Finam, подключаюсь…"
+            while True:
+                try:
+                    scr.refresh_instruments(force=True)
+                    break
+                except Exception as e:
+                    log(f"ошибка ISS (список фьючей): {type(e).__name__}; повтор через 10с")
+                    time.sleep(10)
+            notifier.send_text(f"✅ Скринер запущен (Finam, реальное время): принты "
+                               f"±{args.threshold}% за секунду.")
+            FinamFeed(scr, secret).run()
+        else:
+            scr.run()
     except KeyboardInterrupt:
         print("\nСтоп.")
 

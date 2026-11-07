@@ -9,6 +9,8 @@ services:
         sync: false
       - key: TG_CHAT_ID
         sync: false
+      - key: FINAM_SECRET
+        sync: false
       - key: THRESHOLD
         value: "2"
       - key: MIN_TRADES
