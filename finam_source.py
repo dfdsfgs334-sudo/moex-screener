@@ -11,12 +11,55 @@ from __future__ import annotations
 
 import asyncio
 import os
+import random
 import time
 from collections import deque
 
 from moex_spike_screener import Screener, log
 
 SIDES = {1: "B", 2: "S"}  # Side.SIDE_BUY / SIDE_SELL
+
+
+class OpenLimiter:
+    """Общий ограничитель частоты открытия стримов (у Финама лимит на запросы в минуту)."""
+
+    def __init__(self, per_min: float):
+        self.interval = 60.0 / max(per_min, 1)
+        self.next_at = 0.0
+        self.paused_until = 0.0
+        self.lock = asyncio.Lock()
+
+    async def wait(self):
+        async with self.lock:
+            now = time.monotonic()
+            start = max(now, self.next_at, self.paused_until)
+            self.next_at = start + self.interval
+        await asyncio.sleep(max(0.0, start - time.monotonic()))
+
+    def pause(self, seconds: float):
+        """Упёрлись в лимит — все новые открытия ждут."""
+        self.paused_until = max(self.paused_until, time.monotonic() + seconds)
+
+
+def _is_rate_limit(e: Exception) -> bool:
+    txt = f"{type(e).__name__} {e}".lower()
+    return "rate_limit" in txt or "ratelimit" in txt or "resource_exhausted" in txt \
+        or "too many" in txt
+
+
+def _short(e: Exception) -> str:
+    det = getattr(e, "details", None)
+    try:
+        det = det() if callable(det) else det
+    except Exception:
+        det = None
+    code = getattr(e, "code", None)
+    try:
+        code = code() if callable(code) else code
+    except Exception:
+        code = None
+    code = getattr(code, "name", code)
+    return f"{code or type(e).__name__}: {det or str(e)[:150]}"
 
 
 def _dec(d) -> float:
@@ -39,6 +82,9 @@ class FinamFeed:
         self.seen: dict[str, deque] = {}        # secid -> последние trade_id (дедуп)
         self.dead: set[str] = set()             # символы, которых нет у Финама
         self.errors: dict[str, str] = {}
+        self.limiter = OpenLimiter(float(os.getenv("FINAM_OPENS_PER_MIN", 90)))
+        self.live: set[str] = set()             # стримы, по которым пришли данные
+        self.rl_hits = 0                        # упёрлись в лимит с прошлой сводки
 
     # --- запуск ---
     def run(self):
@@ -126,11 +172,20 @@ class FinamFeed:
                 for secid in new:
                     self.tasks[secid] = asyncio.create_task(self._stream(client, secid))
                 if new:
-                    log(f"[finam] подписок: {len(self.tasks)} (+{len(new)})")
-                    self.scr.source = f"Finam, реальное время, {len(self.tasks)} фьючей"
+                    eta = len(new) * self.limiter.interval / 60
+                    log(f"[finam] подписок: {len(self.tasks)} (+{len(new)}), "
+                        f"открываю постепенно, ~{eta:.0f} мин")
             else:
                 await asyncio.to_thread(self.scr.refresh_instruments)  # num_trades для фильтра
-            # если все стримы упали с ошибкой авторизации — переподключаемся целиком
+            if self.rl_hits:
+                log(f"[finam] лимит запросов: {self.rl_hits} отказов за минуту, открываю медленнее")
+                self.rl_hits = 0
+            summary = (len(self.tasks), len(self.live))
+            if summary != getattr(self, "_last_summary", None):
+                self._last_summary = summary
+                log(f"[finam] стримов: {summary[0]}, с данными: {summary[1]}")
+            self.scr.source = (f"Finam, реальное время, {len(self.live)}/{len(self.tasks)} "
+                               f"фьючей подключено")
             done = [s for s, t in self.tasks.items() if t.done()]
             for s in done:
                 self.tasks.pop(s, None)
@@ -147,6 +202,7 @@ class FinamFeed:
         backoff = 1
         while True:
             try:
+                await self.limiter.wait()
                 req = SubscribeLatestTradesRequest(symbol=symbol)
                 async for resp in client.market_data.SubscribeLatestTrades(req):
                     trades = list(resp.trades)
@@ -170,6 +226,7 @@ class FinamFeed:
                                               can_alert=not t.is_data_snapshot)
                     if trades:
                         self.scr.rate.append((time.time(), len(trades)))
+                        self.live.add(secid)
                     backoff = 1
                     self.errors.pop(secid, None)
             except asyncio.CancelledError:
@@ -183,9 +240,16 @@ class FinamFeed:
                 log(f"[finam] {symbol}: нет доступа: {str(e)[:200]}")
                 await asyncio.sleep(60)
             except Exception as e:
-                msg = f"{type(e).__name__}: {str(e)[:200]}"
-                if self.errors.get(secid) != msg:
-                    log(f"[finam] {symbol}: стрим прервался ({msg}), переподключаюсь")
-                    self.errors[secid] = msg
-                await asyncio.sleep(backoff)
-                backoff = min(backoff * 2, 60)
+                self.live.discard(secid)
+                if _is_rate_limit(e):
+                    # лимит: тормозим все открытия, сам стрим ждёт со случайным сдвигом
+                    self.rl_hits += 1
+                    self.limiter.pause(20)
+                    backoff = min(max(backoff * 2, 10), 120)
+                else:
+                    msg = _short(e)
+                    if self.errors.get(secid) != msg:
+                        log(f"[finam] {symbol}: стрим прервался ({msg}), переподключаюсь")
+                        self.errors[secid] = msg
+                    backoff = min(backoff * 2, 60)
+                await asyncio.sleep(backoff * random.uniform(0.5, 1.5))
