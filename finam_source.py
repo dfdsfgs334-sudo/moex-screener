@@ -142,7 +142,7 @@ class FinamFeed:
                 if "FUT" in (a.type or "").upper() and not a.is_archived:
                     total += 1
                     # только срочный рынок Мосбиржи: у Финама есть и NYMEX, CME и т.д.
-                    if (a.mic or "").upper() == self.fallback_mic.upper():
+                    if (getattr(a, "mic", "") or "").upper() == self.fallback_mic.upper():
                         fut[a.ticker] = a.symbol
             if fut:
                 self.symbols = fut
