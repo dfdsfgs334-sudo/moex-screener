@@ -11,7 +11,5 @@ services:
         sync: false
       - key: THRESHOLD
         value: "2"
-      - key: WINDOW_MIN
-        value: "5"
       - key: MIN_TRADES
         value: "30"

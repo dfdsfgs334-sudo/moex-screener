@@ -5,4 +5,4 @@ COPY requirements.txt .
 RUN pip install --no-cache-dir -r requirements.txt
 COPY moex_spike_screener.py .
 EXPOSE 8080
-CMD ["python", "moex_spike_screener.py", "--plain", "--no-beep", "--csv", ""]
+CMD ["python", "moex_spike_screener.py"]
