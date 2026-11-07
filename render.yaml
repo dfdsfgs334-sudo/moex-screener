@@ -1,0 +1,17 @@
+services:
+  - type: web
+    name: moex-spike-screener
+    runtime: docker
+    plan: free
+    healthCheckPath: /health
+    envVars:
+      - key: TG_TOKEN
+        sync: false
+      - key: TG_CHAT_ID
+        sync: false
+      - key: THRESHOLD
+        value: "2"
+      - key: WINDOW_MIN
+        value: "5"
+      - key: MIN_TRADES
+        value: "30"
