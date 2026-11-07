@@ -119,7 +119,15 @@ class FinamFeed:
             from finam_trade_api.metrics import GetUsageMetricsRequest
             resp = await client.metrics.GetUsageMetrics(GetUsageMetricsRequest())
             for q in getattr(resp, "quotas", []):
-                log(f"[finam] квота {q.name}: {q.remaining}/{q.limit}")
+                if "latesttrades" in q.name.lower():
+                    reset = ""
+                    try:
+                        if q.reset_time.seconds:
+                            left = q.reset_time.seconds - time.time()
+                            reset = f", сброс через {left:.0f}с"
+                    except Exception:
+                        pass
+                    log(f"[finam] квота {q.name}: {q.remaining}/{q.limit}{reset}")
         except Exception as e:
             log(f"[finam] квоты получить не удалось: {type(e).__name__}")
 
@@ -129,13 +137,18 @@ class FinamFeed:
             from finam_trade_api.assets import AssetsRequest
             resp = await client.assets.Assets(AssetsRequest())
             fut = {}
+            total = 0
             for a in resp.assets:
                 if "FUT" in (a.type or "").upper() and not a.is_archived:
-                    fut[a.ticker] = a.symbol
+                    total += 1
+                    # только срочный рынок Мосбиржи: у Финама есть и NYMEX, CME и т.д.
+                    if (a.mic or "").upper() == self.fallback_mic.upper():
+                        fut[a.ticker] = a.symbol
             if fut:
                 self.symbols = fut
                 sample = ", ".join(list(fut.values())[:3])
-                log(f"[finam] фьючей в справочнике: {len(fut)} (пример: {sample})")
+                log(f"[finam] фьючей в справочнике: {total}, из них FORTS (@{self.fallback_mic}): "
+                    f"{len(fut)} (пример: {sample})")
                 return
             log("[finam] в справочнике не нашлось фьючей — использую ticker@" + self.fallback_mic)
         except Exception as e:
