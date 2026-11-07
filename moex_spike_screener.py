@@ -76,14 +76,24 @@ class MoexClient:
             else:
                 print(f"[auth] MOEX Passport: не удалось ({r.status_code}), работаю анонимно")
 
-    def fetch(self) -> list[Quote]:
-        r = self.s.get(
-            ISS_URL,
-            params={"iss.meta": "off", "iss.only": "securities,marketdata"},
-            timeout=15,
-        )
-        r.raise_for_status()
-        js = r.json()
+    PARAMS = {
+        "iss.meta": "off",
+        "iss.only": "securities,marketdata",
+        "securities.columns": "SECID,SHORTNAME,ASSETCODE,PREVSETTLEPRICE,LASTTRADEDATE",
+        "marketdata.columns": "SECID,LAST,NUMTRADES,VALTODAY,UPDATETIME,TIME",
+    }
+
+    def fetch(self, retries: int = 3) -> list[Quote]:
+        for attempt in range(retries):
+            try:
+                r = self.s.get(ISS_URL, params=self.PARAMS, timeout=15)
+                r.raise_for_status()
+                js = r.json()
+                break
+            except (requests.RequestException, ValueError):
+                if attempt == retries - 1:
+                    raise
+                time.sleep(1 + attempt)
         secs = {row["SECID"]: row for row in iss_table(js, "securities")}
         out: list[Quote] = []
         for md in iss_table(js, "marketdata"):
@@ -254,6 +264,16 @@ class Notifier:
             with open(csv_path, "w", newline="", encoding="utf-8") as f:
                 csv.writer(f).writerow(["time", "kind", "secid", "name", "dir", "pct",
                                         "price", "ref_price", "window_s", "day_pct", "val_today"])
+
+    def send_text(self, text: str):
+        if not (self.tg_token and self.tg_chat):
+            return
+        try:
+            self.s.post(f"https://api.telegram.org/bot{self.tg_token}/sendMessage",
+                        data={"chat_id": self.tg_chat, "text": text, "parse_mode": "HTML",
+                              "disable_web_page_preview": True}, timeout=10)
+        except requests.RequestException as e:
+            print(f"[tg] ошибка отправки: {e}", file=sys.stderr)
 
     def send(self, a: Alert):
         if self.beep:
@@ -445,6 +465,8 @@ def main():
     feed: deque[Alert] = deque(maxlen=200)
     quotes: dict[str, Quote] = {}
     errors = 0
+    first_tick = True
+    startup: list[Alert] = []
     status_line = "старт…"
     lock = threading.Lock()
 
@@ -480,7 +502,7 @@ def main():
         return new
 
     def _tick() -> str:
-        nonlocal errors
+        nonlocal errors, first_tick
         try:
             data = client.fetch()
             errors = 0
@@ -502,8 +524,23 @@ def main():
             quotes[q.secid] = q
             for a in det.update(q, now):
                 feed.appendleft(a)
+                if first_tick:
+                    startup.append(a)   # уже ушедшие за порог до старта — одной сводкой
+                    continue
                 notifier.send(a)
                 log(fmt_alert(a).replace("\n", " | "))
+        if first_tick:
+            first_tick = False
+            startup.sort(key=lambda a: -abs(a.pct))
+            lines = [f"{'🚀' if a.direction > 0 else '🩸'} <b>{htmlmod.escape(a.secid)}</b> "
+                     f"{a.pct:+.2f}% к клирингу" for a in startup[:40]]
+            more = f"\n…и ещё {len(startup) - 40}" if len(startup) > 40 else ""
+            msg = (f"✅ Скринер запущен: {n} фьючей, порог ±{args.threshold}%, "
+                   f"окно {args.window:g} мин.")
+            if startup:
+                msg += f"\nУже за порогом ({len(startup)}):\n" + "\n".join(lines) + more
+            notifier.send_text(msg)
+            log(f"старт: уже за порогом {len(startup)} шт. (сводкой)")
         last_upd = max((q.update_time for q in data), default="")
         return (f"{datetime.now():%H:%M:%S}  инструментов: {n}  |  порог ±{args.threshold}%  "
                 f"окно {args.window:g} мин  опрос {args.interval:g}с  |  "
