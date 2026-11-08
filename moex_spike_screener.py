@@ -210,6 +210,7 @@ class Notifier:
         self.tg_chats = [c.strip() for c in (tg_chat or "").split(",") if c.strip()]
         self.tg_chat = ",".join(self.tg_chats)
         self.csv_path = csv_path
+        self.hub = None  # публичный бот (tg_bot.BotHub), если включён
         self.s = requests.Session()
         if csv_path and not os.path.exists(csv_path):
             with open(csv_path, "w", newline="", encoding="utf-8") as f:
@@ -281,7 +282,10 @@ class Notifier:
                 csv.writer(f).writerow([a.exch_time, a.seen.isoformat(timespec="seconds"), a.secid,
                                         a.name, a.direction, f"{a.pct:.3f}", a.price, a.ref,
                                         a.qty, a.side])
-        self.send_text(fmt_alert(a, html=True))
+        text = fmt_alert(a, html=True)
+        self.send_text(text)
+        if self.hub:
+            self.hub.broadcast(text, a.pct, skip=set(self.tg_chats))
 
 
 # ─────────────────────────── веб-дашборд ───────────────────────────
@@ -551,6 +555,17 @@ def main():
 
     client = MoexClient(os.getenv("MOEX_LOGIN"), os.getenv("MOEX_PASSWORD"))
     scr = Screener(args, client, notifier)
+    if notifier.tg_token and notifier.tg_chats and os.getenv("PUBLIC_BOT", "1") != "0":
+        from tg_bot import BotHub
+
+        def bot_status() -> str:
+            st = dict(scr.state()["status"])
+            return (f"источник: {st.get('источник')}\nбиржа: {st.get('биржа')}, "
+                    f"сделок/мин: {st.get('сделок/мин')}, прострелов: {st.get('прострелов')}")
+        notifier.hub = BotHub(notifier.tg_token, notifier.tg_chats[0], args.threshold, log,
+                              bot_status)
+        notifier.hub.start()
+        log("[bot] публичный бот включён: любой может написать боту /start")
     if os.getenv("PORT"):
         start_web(int(os.getenv("PORT")), scr.state)
     secret = (os.getenv("FINAM_SECRET") or "").strip()
