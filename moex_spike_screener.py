@@ -206,7 +206,9 @@ def fmt_alert(a: Alert, html: bool = False) -> str:
 class Notifier:
     def __init__(self, tg_token: str | None, tg_chat: str | None, csv_path: str | None):
         self.tg_token = (tg_token or "").strip()
-        self.tg_chat = (tg_chat or "").strip()
+        # несколько получателей через запятую: личка, канал (@name или -100…), группа
+        self.tg_chats = [c.strip() for c in (tg_chat or "").split(",") if c.strip()]
+        self.tg_chat = ",".join(self.tg_chats)
         self.csv_path = csv_path
         self.s = requests.Session()
         if csv_path and not os.path.exists(csv_path):
@@ -219,25 +221,39 @@ class Notifier:
         return bool(self.tg_token and self.tg_chat)
 
     def send_text(self, text: str) -> bool:
+        """Шлёт всем получателям. True — дошло хотя бы до одного."""
         if not self.enabled:
             return False
-        try:
-            r = self.s.post(f"https://api.telegram.org/bot{self.tg_token}/sendMessage",
-                            data={"chat_id": self.tg_chat, "text": text, "parse_mode": "HTML",
-                                  "disable_web_page_preview": True}, timeout=10)
-            if r.ok:
-                return True
+        return any([self._send_one(chat, text) for chat in self.tg_chats])
+
+    def _send_one(self, chat: str, text: str, attempts: int = 3) -> bool:
+        for _ in range(attempts):
             try:
-                desc = r.json().get("description", r.text)
-            except ValueError:
-                desc = r.text[:200]
-            hint = {401: "неверный TG_TOKEN",
-                    400: "неверный TG_CHAT_ID или у бота не нажат Start",
-                    403: "бот заблокирован или не добавлен в чат",
-                    429: "Telegram просит слать реже"}.get(r.status_code, "")
-            log(f"[tg] Telegram ответил {r.status_code}: {desc}{' — ' + hint if hint else ''}")
-        except requests.RequestException as e:
-            log(f"[tg] ошибка сети: {e}")
+                r = self.s.post(f"https://api.telegram.org/bot{self.tg_token}/sendMessage",
+                                data={"chat_id": chat, "text": text, "parse_mode": "HTML",
+                                      "disable_web_page_preview": True}, timeout=10)
+                if r.ok:
+                    return True
+                try:
+                    js = r.json()
+                except ValueError:
+                    js = {}
+                if r.status_code == 429:  # лимит Telegram (в канал ~20 сообщений/мин)
+                    wait = (js.get("parameters") or {}).get("retry_after", 5)
+                    log(f"[tg] {chat}: Telegram просит подождать {wait}с")
+                    time.sleep(min(float(wait), 60))
+                    continue
+                desc = js.get("description", r.text[:200])
+                hint = {401: "неверный TG_TOKEN",
+                        400: "неверный chat id, у бота не нажат Start или бот не добавлен в канал",
+                        403: "бот заблокирован, не добавлен в чат или не админ канала"
+                        }.get(r.status_code, "")
+                log(f"[tg] {chat}: Telegram ответил {r.status_code}: {desc}"
+                    f"{' — ' + hint if hint else ''}")
+                return False
+            except requests.RequestException as e:
+                log(f"[tg] {chat}: ошибка сети: {e}")
+                time.sleep(2)
         return False
 
     def send(self, a: Alert):
