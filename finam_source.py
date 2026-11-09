@@ -173,7 +173,10 @@ class FinamFeed:
                 continue
             cands.append((info.get("num_trades", 0), info.get("prev_oi", 0), secid))
         cands.sort(reverse=True)
-        return [s for *_, s in cands[: self.max_streams]]
+        # US-вечники подписываем всегда и первыми, остальное — по ликвидности
+        us = [s for *_, s in cands if s.upper() in scr.us]
+        rest = [s for *_, s in cands if s.upper() not in scr.us]
+        return (us + rest)[: max(self.max_streams, len(us))]
 
     async def _supervise(self, client):
         last_refresh = 0.0

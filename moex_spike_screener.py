@@ -39,6 +39,23 @@ PASSPORT_URL = "https://passport.moex.com/authenticate"
 PAGE_LIMIT = 5000  # максимум строк, который ISS отдаёт за один запрос
 
 
+# Вечные фьючерсы FORTS на американские акции/индексы. Список можно переопределить
+# переменной US_PERPS (через запятую) или дополнить US_PERPS_ADD.
+US_PERPS_DEFAULT = (
+    "QQQF,SP500F,NBISF,BSXF,AMDF,SNDKF,CMGF,LULUF,COHRF,AMZNF,TSLAF,SMCIF,CVNAF,"
+    "NFLXF,COINF,LITEF,PANWF,UBERF,DASHF,HOODF,APPF,CRWDF"
+)
+
+
+def us_perps_from_env() -> set[str]:
+    base = os.getenv("US_PERPS", US_PERPS_DEFAULT)
+    extra = os.getenv("US_PERPS_ADD", "")
+    return {x.strip().upper() for x in f"{base},{extra}".split(",") if x.strip()}
+
+
+US_PERPS: set[str] = us_perps_from_env()
+
+
 def log(msg: str):
     print(f"{datetime.now():%H:%M:%S} {msg}", flush=True)
 
@@ -154,6 +171,7 @@ class PrintDetector:
         self.ref_max_age = ref_max_age
         self.cooldown = cooldown
         self.escalate = escalate
+        self.ref_age_override: dict[str, float] = {}   # свой REF_MAX_AGE для тикера
         self.state: dict[str, SecState] = {}
 
     def on_trade(self, secid: str, ts: float, price: float) -> tuple[int, float, float] | None:
@@ -164,7 +182,8 @@ class PrintDetector:
             # новая секунда: рынок = медиана последних N сделок за REF_MAX_AGE секунд до неё
             st.cur_sec = ts
             st.sec_open = price
-            last = [p for t, p in list(st.recent)[-self.ref_n:] if ts - t <= self.ref_max_age]
+            max_age = self.ref_age_override.get(secid, self.ref_max_age)
+            last = [p for t, p in list(st.recent)[-self.ref_n:] if ts - t <= max_age]
             st.ref = statistics.median(last) if last else None
         # кандидаты на «рынок»: медиана до этой секунды и первая сделка этой секунды
         best = None
@@ -198,7 +217,9 @@ def fmt_alert(a: Alert, html: bool = False) -> str:
     arrow = "🚀" if a.direction > 0 else "🩸"
     side = {"B": "покупка", "S": "продажа"}.get(a.side, a.side or "?")
     lag = f"задержка {a.lag_s / 60:.0f} мин" if a.lag_s >= 90 else f"задержка {a.lag_s:.0f} с"
-    return (f"{arrow} {b(a.secid)} ({esc(a.name)}) принт {a.pct:+.2f}% за секунду\n"
+    us = "🇺🇸 " if a.secid.upper() in US_PERPS else ""
+    name = "вечник US" if us and a.name.upper() == a.secid.upper() else a.name
+    return (f"{arrow} {us}{b(a.secid)} ({esc(name)}) принт {a.pct:+.2f}% за секунду\n"
             f"{fmt_price(a.ref)} → {fmt_price(a.price)} | {a.qty} лот, {side}\n"
             f"биржа {a.exch_time} ({lag})")
 
@@ -365,6 +386,9 @@ class Screener:
         self.notifier = notifier
         self.det = PrintDetector(args.threshold, args.ref_trades, args.ref_max_age,
                                  args.cooldown, args.escalate)
+        self.us = set() if os.getenv("US_PERPS_ON", "1") == "0" else set(US_PERPS)
+        us_age = float(os.getenv("US_REF_MAX_AGE", 60))
+        self.det.ref_age_override = {s: us_age for s in self.us}
         self.only = {x.strip().upper() for x in args.only.split(",") if x.strip()}
         self.excl = {x.strip().upper() for x in args.exclude.split(",") if x.strip()}
         self.instr: dict[str, dict] = {}
@@ -388,6 +412,8 @@ class Screener:
             return False
         if secid.upper() in self.excl or asset in self.excl:
             return False
+        if secid.upper() in self.us:
+            return True  # US-вечники неликвидны — фильтр по числу сделок не применяем
         return info.get("num_trades", 0) >= self.a.min_trades
 
     def refresh_instruments(self, force=False):
