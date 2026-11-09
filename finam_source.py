@@ -75,8 +75,10 @@ class FinamFeed:
     def __init__(self, scr: Screener, secret: str):
         self.scr = scr
         self.secret = secret
-        self.max_streams = int(os.getenv("FINAM_MAX_STREAMS", 200))
+        self.max_streams = int(os.getenv("FINAM_MAX_STREAMS", 350))
         self.fallback_mic = os.getenv("FINAM_FUT_MIC", "RTSX")
+        self.stock_mic = os.getenv("FINAM_STOCK_MIC", "MISX").upper()
+        self.stock_symbols: dict[str, str] = {}     # фонды: secid -> ticker@MISX
         self.symbols: dict[str, str] = {}       # secid -> ticker@mic
         self.tasks: dict[str, asyncio.Task] = {}
         self.seen: dict[str, deque] = {}        # secid -> последние trade_id (дедуп)
@@ -139,6 +141,9 @@ class FinamFeed:
             fut = {}
             total = 0
             for a in resp.assets:
+                mic = (getattr(a, "mic", "") or "").upper()
+                if mic == self.stock_mic and not a.is_archived:
+                    self.stock_symbols[a.ticker] = a.symbol   # фонды фондового рынка
                 if "FUT" in (a.type or "").upper() and not a.is_archived:
                     total += 1
                     # только срочный рынок Мосбиржи: у Финама есть и NYMEX, CME и т.д.
@@ -157,6 +162,8 @@ class FinamFeed:
         self.symbols = {}
 
     def _symbol(self, secid: str) -> str:
+        if self.scr.is_etf(secid):
+            return self.stock_symbols.get(secid) or f"{secid}@{self.stock_mic}"
         return self.symbols.get(secid) or f"{secid}@{self.fallback_mic}"
 
     # --- какие фьючи слушать ---
@@ -169,14 +176,19 @@ class FinamFeed:
                 continue
             if secid.upper() in scr.excl or asset in scr.excl or secid in self.dead:
                 continue
-            if self.symbols and secid not in self.symbols:
+            etf = info.get("kind") == "etf"
+            if etf and not scr.etf_on:
+                continue
+            if not etf and self.symbols and secid not in self.symbols:
                 continue
             cands.append((info.get("num_trades", 0), info.get("prev_oi", 0), secid))
         cands.sort(reverse=True)
-        # US-вечники подписываем всегда и первыми, остальное — по ликвидности
+        # US-вечники и фонды подписываем всегда и первыми, фьючи — по ликвидности в лимите
         us = [s for *_, s in cands if s.upper() in scr.us]
-        rest = [s for *_, s in cands if s.upper() not in scr.us]
-        return (us + rest)[: max(self.max_streams, len(us))]
+        etfs = [s for *_, s in cands if scr.is_etf(s)]
+        rest = [s for *_, s in cands if s.upper() not in scr.us and not scr.is_etf(s)]
+        room = max(self.max_streams - len(us) - len(etfs), 0)
+        return us + etfs + rest[:room]
 
     async def _supervise(self, client):
         last_refresh = 0.0

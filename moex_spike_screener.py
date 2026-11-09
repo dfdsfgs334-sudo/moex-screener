@@ -34,7 +34,8 @@ from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 
 import requests
 
-ISS = "https://iss.moex.com/iss/engines/futures/markets/forts"
+ISS_ROOT = "https://iss.moex.com/iss/engines"
+ISS = f"{ISS_ROOT}/futures/markets/forts"
 PASSPORT_URL = "https://passport.moex.com/authenticate"
 PAGE_LIMIT = 5000  # максимум строк, который ISS отдаёт за один запрос
 
@@ -54,6 +55,7 @@ def us_perps_from_env() -> set[str]:
 
 
 US_PERPS: set[str] = us_perps_from_env()
+ETF_SECIDS: set[str] = set()   # заполняется из справочника ISS (тип бумаги J)
 
 
 def log(msg: str):
@@ -69,9 +71,18 @@ def iss_rows(js: dict, key: str) -> list[dict]:
 
 
 class MoexClient:
+    """Клиент ISS для одного рынка. По умолчанию — срочный рынок FORTS."""
     TRADE_COLS = "TRADENO,SECID,PRICE,QUANTITY,SYSTIME,BUYSELL,RECNO,OFFMARKETDEAL"
+    SEQ = "RECNO"           # монотонный номер записи в ленте
+    KIND = "fut"
+    LABEL = "FORTS"
 
-    def __init__(self, login: str | None = None, password: str | None = None):
+    def __init__(self, login: str | None = None, password: str | None = None,
+                 base: str = ISS, session: requests.Session | None = None):
+        self.base = base
+        if session is not None:   # общая сессия (cookie авторизации MOEX Passport)
+            self.s = session
+            return
         self.s = requests.Session()
         self.s.headers["User-Agent"] = "moex-spike-screener/2.0"
         if login and password:
@@ -83,7 +94,7 @@ class MoexClient:
         params = {"iss.meta": "off", **params}
         for attempt in range(retries):
             try:
-                r = self.s.get(f"{ISS}/{path}", params=params, timeout=20)
+                r = self.s.get(f"{self.base}/{path}", params=params, timeout=30)
                 r.raise_for_status()
                 return r.json()
             except (requests.RequestException, ValueError):
@@ -106,6 +117,8 @@ class MoexClient:
         for r in iss_rows(js, "marketdata"):
             if r["SECID"] in out:
                 out[r["SECID"]]["num_trades"] = int(r.get("NUMTRADES") or 0)
+        for v in out.values():
+            v["kind"] = self.KIND
         return out
 
     def trades(self, start: int, limit: int = PAGE_LIMIT) -> list[dict]:
@@ -135,6 +148,39 @@ class MoexClient:
             else:
                 hi = mid
         return hi
+
+
+class EtfClient(MoexClient):
+    """Биржевые фонды (БПИФ/ETF) фондового рынка: тип бумаги J в режимах TQBR, TQTY…"""
+    TRADE_COLS = "TRADENO,SECID,PRICE,QUANTITY,SYSTIME,BUYSELL"
+    SEQ = "TRADENO"
+    KIND = "etf"
+
+    NEXT_TRADE = True       # номер сделки сквозной: можно читать «всё после №N»
+
+    def __init__(self, board: str, session: requests.Session):
+        super().__init__(base=f"{ISS_ROOT}/stock/markets/shares/boards/{board}", session=session)
+        self.board = board
+        self.LABEL = f"фонды {board}"
+
+    def trades_after(self, tradeno: int, limit: int = PAGE_LIMIT) -> list[dict]:
+        js = self.get("trades.json", {"tradeno": tradeno, "next_trade": 1, "limit": limit,
+                                      "trades.columns": self.TRADE_COLS})
+        return iss_rows(js, "trades")
+
+    def instruments(self) -> dict[str, dict]:
+        js = self.get("securities.json", {
+            "iss.only": "securities,marketdata",
+            "securities.columns": "SECID,SHORTNAME,SECTYPE",
+            "marketdata.columns": "SECID,NUMTRADES",
+        })
+        out = {r["SECID"]: {"name": r.get("SHORTNAME") or r["SECID"], "asset": r["SECID"],
+                            "num_trades": 0, "prev_oi": 0, "kind": "etf"}
+               for r in iss_rows(js, "securities") if r.get("SECTYPE") == "J"}
+        for r in iss_rows(js, "marketdata"):
+            if r["SECID"] in out:
+                out[r["SECID"]]["num_trades"] = int(r.get("NUMTRADES") or 0)
+        return out
 
 
 # ─────────────────────────── детектор ───────────────────────────
@@ -182,7 +228,7 @@ class PrintDetector:
             # новая секунда: рынок = медиана последних N сделок за REF_MAX_AGE секунд до неё
             st.cur_sec = ts
             st.sec_open = price
-            max_age = self.ref_age_override.get(secid, self.ref_max_age)
+            max_age = self.ref_age_override.get(secid.split(":")[0], self.ref_max_age)
             last = [p for t, p in list(st.recent)[-self.ref_n:] if ts - t <= max_age]
             st.ref = statistics.median(last) if last else None
         # кандидаты на «рынок»: медиана до этой секунды и первая сделка этой секунды
@@ -218,7 +264,11 @@ def fmt_alert(a: Alert, html: bool = False) -> str:
     side = {"B": "покупка", "S": "продажа"}.get(a.side, a.side or "?")
     lag = f"задержка {a.lag_s / 60:.0f} мин" if a.lag_s >= 90 else f"задержка {a.lag_s:.0f} с"
     us = "🇺🇸 " if a.secid.upper() in US_PERPS else ""
+    etf = "📊 " if a.secid in ETF_SECIDS else ""
     name = "вечник US" if us and a.name.upper() == a.secid.upper() else a.name
+    if etf:
+        name = a.name.replace(" ETF", "") + " · фонд"
+    us = us or etf
     return (f"{arrow} {us}{b(a.secid)} ({esc(name)}) принт {a.pct:+.2f}% за секунду\n"
             f"{fmt_price(a.ref)} → {fmt_price(a.price)} | {a.qty} лот, {side}\n"
             f"биржа {a.exch_time} ({lag})")
@@ -379,10 +429,81 @@ def parse_ts(systime: str) -> float:
     return datetime.strptime(systime, "%Y-%m-%d %H:%M:%S").replace(tzinfo=MSK).timestamp()
 
 
+class IssFeed:
+    """Инкрементальное чтение ленты сделок одного рынка ISS."""
+
+    def __init__(self, client: MoexClient):
+        self.c = client
+        self.offset = 0
+        self.last_seq = 0
+        self.empty_since = 0.0
+
+    def seek_to_end(self):
+        if getattr(self.c, "NEXT_TRADE", False):
+            last = self.c.latest_trade()
+            self.last_seq = int(last[self.c.SEQ]) if last else 0
+            self.empty_since = 0.0
+            log(f"лента {self.c.LABEL}: начинаю после сделки №{self.last_seq}")
+            return
+        n = self.c.count_trades()
+        self.offset = n
+        last = self.c.latest_trade()
+        self.last_seq = int(last[self.c.SEQ]) if last else 0
+        self.empty_since = 0.0
+        log(f"лента {self.c.LABEL}: в сессии {n} сделок, начинаю с новых")
+
+    def poll(self, scr: "Screener") -> bool:
+        if getattr(self.c, "NEXT_TRADE", False):
+            rows = self.c.trades_after(self.last_seq) if self.last_seq else self.c.trades(0)
+        else:
+            rows = self.c.trades(self.offset)
+        if rows:
+            self.empty_since = 0.0
+            now = time.time()
+            for r in rows:
+                self.offset += 1
+                seq = int(r.get(self.c.SEQ) or 0)
+                if seq and seq <= self.last_seq:
+                    continue  # уже видели
+                self.last_seq = max(self.last_seq, seq)
+                scr.processed += 1
+                if r.get("OFFMARKETDEAL"):
+                    continue  # адресные/внебиржевые сделки — цена произвольная
+                secid, price, systime = r.get("SECID"), r.get("PRICE"), r.get("SYSTIME")
+                if not secid or not price or not systime:
+                    continue
+                if self.c.KIND == "etf" and not scr.is_etf(secid):
+                    continue  # в режиме TQBR лента общая с акциями — берём только фонды
+                # один фонд может торговаться в рублях (TQBR) и юанях (TQTY) —
+                # история цен у каждого режима своя, иначе разница валют = «прострел»
+                key = f"{secid}:{self.c.board}" if self.c.KIND == "etf" else secid
+                scr.handle_trade(secid, parse_ts(systime), float(price),
+                                 int(r.get("QUANTITY") or 0), r.get("BUYSELL") or "",
+                                 key=key, board=getattr(self.c, "board", ""))
+            scr.rate.append((now, len(rows)))
+            return len(rows) >= PAGE_LIMIT
+        # пусто: либо тишина, либо биржа начала новую сессию и нумерация сбросилась
+        now = time.time()
+        if not self.empty_since:
+            self.empty_since = now
+        elif now - self.empty_since > 30:
+            self.empty_since = now
+            last = self.c.latest_trade()
+            if last and int(last[self.c.SEQ]) > self.last_seq:
+                log(f"лента {self.c.LABEL}: новая торговая сессия — пересчитываю позицию")
+                self.seek_to_end()
+        return False
+
+
 class Screener:
-    def __init__(self, args, client: MoexClient, notifier: Notifier):
+    def __init__(self, args, client: MoexClient, notifier: Notifier,
+                 extra_clients: list[MoexClient] | None = None):
         self.a = args
         self.client = client
+        self.clients = [c for c in [client, *(extra_clients or [])] if c is not None]
+        self.feeds = [IssFeed(c) for c in self.clients]
+        self.etf_on = os.getenv("ETF_ON", "1") != "0"
+        self.etf_age = float(os.getenv("ETF_REF_MAX_AGE", 60))
         self.notifier = notifier
         self.det = PrintDetector(args.threshold, args.ref_trades, args.ref_max_age,
                                  args.cooldown, args.escalate)
@@ -393,9 +514,6 @@ class Screener:
         self.excl = {x.strip().upper() for x in args.exclude.split(",") if x.strip()}
         self.instr: dict[str, dict] = {}
         self.instr_at = 0.0
-        self.offset = 0
-        self.last_recno = 0
-        self.empty_since = 0.0
         self.alerts: deque[Alert] = deque(maxlen=300)
         self.processed = 0
         self.rate = deque(maxlen=600)      # (time, trades) для сделок/мин
@@ -414,54 +532,43 @@ class Screener:
             return False
         if secid.upper() in self.us:
             return True  # US-вечники неликвидны — фильтр по числу сделок не применяем
+        if info.get("kind") == "etf":
+            return self.etf_on  # фонды — все, без фильтра ликвидности
         return info.get("num_trades", 0) >= self.a.min_trades
+
+    def is_etf(self, secid: str) -> bool:
+        return self.instr.get(secid, {}).get("kind") == "etf"
 
     def refresh_instruments(self, force=False):
         if force or time.time() - self.instr_at > 60:
-            try:
-                self.instr = self.client.instruments()
+            merged: dict[str, dict] = {}
+            for c in self.clients:
+                try:
+                    merged.update(c.instruments())
+                except Exception as e:
+                    if force and c is self.client:
+                        raise
+                    self.last_err = f"инструменты {c.LABEL}: {type(e).__name__}"
+            if merged:
+                self.instr = merged
                 self.instr_at = time.time()
-            except Exception as e:
-                if force:
-                    raise
-                self.last_err = f"инструменты: {type(e).__name__}"
-
-    def seek_to_end(self):
-        n = self.client.count_trades()
-        self.offset = n
-        last = self.client.latest_trade()
-        self.last_recno = int(last["RECNO"]) if last else 0
-        self.empty_since = 0.0
-        log(f"лента сделок: в сессии {n} сделок, начинаю с новых")
-
-    # --- обработка ---
-    def process(self, rows: list[dict]):
-        now = time.time()
-        for r in rows:
-            self.offset += 1
-            recno = int(r.get("RECNO") or 0)
-            if recno and recno <= self.last_recno:
-                continue  # уже видели
-            self.last_recno = max(self.last_recno, recno)
-            self.processed += 1
-            if r.get("OFFMARKETDEAL"):
-                continue  # адресные/внебиржевые сделки — цена произвольная
-            secid, price, systime = r.get("SECID"), r.get("PRICE"), r.get("SYSTIME")
-            if not secid or not price or not systime:
-                continue
-            self.handle_trade(secid, parse_ts(systime), float(price),
-                              int(r.get("QUANTITY") or 0), r.get("BUYSELL") or "")
-        self.rate.append((now, len(rows)))
+                for secid, info in merged.items():
+                    if info.get("kind") == "etf":
+                        self.det.ref_age_override[secid] = self.etf_age
+                        ETF_SECIDS.add(secid)
 
     def handle_trade(self, secid: str, ts: float, price: float, qty: int, side: str,
-                     can_alert: bool = True):
+                     can_alert: bool = True, key: str | None = None, board: str = ""):
         """Общая обработка сделки для любого источника (ISS или Finam)."""
         self.last_exch = datetime.fromtimestamp(ts, MSK).strftime("%H:%M:%S")
-        hit = self.det.on_trade(secid, ts, price)
+        hit = self.det.on_trade(key or secid, ts, price)
         if hit and can_alert and self.allowed(secid):
             d, pct, ref = hit
-            a = Alert(self.last_exch, datetime.now(), secid,
-                      self.instr.get(secid, {}).get("name", secid), d, pct, price,
+            name = self.instr.get(secid, {}).get("name", secid)
+            cur = {"TQTY": "¥", "TQTD": "$", "TQTE": "€", "TQTH": "HK$"}.get(board)
+            if cur:
+                name = f"{name} {cur}"
+            a = Alert(self.last_exch, datetime.now(), secid, name, d, pct, price,
                       ref, qty, side, time.time() - ts)
             with self.lock:
                 self.alerts.appendleft(a)
@@ -469,24 +576,23 @@ class Screener:
             self.notifier.send(a)
 
     def tick(self) -> bool:
-        """Один опрос. True — есть ещё данные, опросить сразу."""
+        """Один опрос всех лент. True — где-то есть ещё данные, опросить сразу."""
         self.refresh_instruments()
-        rows = self.client.trades(self.offset)
-        if rows:
-            self.empty_since = 0.0
-            self.process(rows)
-            return len(rows) >= PAGE_LIMIT
-        # пусто: либо тишина, либо биржа начала новую сессию и нумерация сбросилась
-        now = time.time()
-        if not self.empty_since:
-            self.empty_since = now
-        elif now - self.empty_since > 30:
-            self.empty_since = now
-            last = self.client.latest_trade()
-            if last and int(last["RECNO"]) > self.last_recno:
-                log("новая торговая сессия — пересчитываю позицию в ленте")
-                self.seek_to_end()
-        return False
+        more = False
+        for f in self.feeds:
+            try:
+                more |= f.poll(self)
+            except Exception as e:
+                self.last_err = f"ISS {f.c.LABEL}: {type(e).__name__}"
+                log(f"ошибка ISS ({f.c.LABEL}): {type(e).__name__}: {str(e)[:200]}")
+        return more
+
+    def coverage(self) -> str:
+        fut = sum(1 for s, v in self.instr.items() if v.get("kind") == "fut" and self.allowed(s))
+        us = sum(1 for s in self.instr if s.upper() in self.us and self.allowed(s))
+        etf = sum(1 for s, v in self.instr.items() if v.get("kind") == "etf" and self.allowed(s))
+        return (f"принты ±{self.a.threshold}% за секунду — фьючей {fut} (из них US-вечников {us})"
+                + (f", фондов {etf}" if etf else ""))
 
     def state(self) -> dict:
         with self.lock:
@@ -509,16 +615,14 @@ class Screener:
         while True:
             try:
                 self.refresh_instruments(force=True)
-                self.seek_to_end()
+                for f in self.feeds:
+                    f.seek_to_end()
                 break
             except Exception as e:
                 self.last_err = f"старт: {type(e).__name__}"
                 log(f"ошибка ISS при старте: {e}; повтор через 10с")
                 time.sleep(10)
-        n_ok = sum(1 for s in self.instr if self.allowed(s))
-        self.notifier.send_text(
-            f"✅ Скринер запущен: слежу за принтами ±{self.a.threshold}% за секунду "
-            f"по {n_ok} фьючам (≥{self.a.min_trades} сделок за день).")
+        self.notifier.send_text(f"✅ Скринер запущен: {self.coverage()}")
         last_hb = time.time()
         while True:
             try:
@@ -580,7 +684,12 @@ def main():
         log("[tg] TG_TOKEN или TG_CHAT_ID не заданы — алерты в Telegram не пойдут")
 
     client = MoexClient(os.getenv("MOEX_LOGIN"), os.getenv("MOEX_PASSWORD"))
-    scr = Screener(args, client, notifier)
+    etf_clients = []
+    if os.getenv("ETF_ON", "1") != "0":
+        boards = [b.strip().upper() for b in os.getenv("ETF_BOARDS", "TQBR,TQTY").split(",")
+                  if b.strip()]
+        etf_clients = [EtfClient(b, client.s) for b in boards]
+    scr = Screener(args, client, notifier, etf_clients)
     if notifier.tg_token and notifier.tg_chats and os.getenv("PUBLIC_BOT", "1") != "0":
         from tg_bot import BotHub
 
@@ -606,8 +715,7 @@ def main():
                 except Exception as e:
                     log(f"ошибка ISS (список фьючей): {type(e).__name__}; повтор через 10с")
                     time.sleep(10)
-            notifier.send_text(f"✅ Скринер запущен (Finam, реальное время): принты "
-                               f"±{args.threshold}% за секунду.")
+            notifier.send_text(f"✅ Скринер запущен (Finam, реальное время): {scr.coverage()}")
             FinamFeed(scr, secret).run()
         else:
             scr.run()
