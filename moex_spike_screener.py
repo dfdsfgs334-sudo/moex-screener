@@ -54,7 +54,18 @@ def us_perps_from_env() -> set[str]:
     return {x.strip().upper() for x in f"{base},{extra}".split(",") if x.strip()}
 
 
-US_PERPS: set[str] = us_perps_from_env()
+US_PERPS: set[str] = us_perps_from_env()   # + квартальные контракты на US_ASSETS (из справочника)
+
+# Квартальные фьючи FORTS на американские акции, индексы и ETF — по базовому активу
+# (ASSETCODE), чтобы новые контракты при смене квартала подхватывались сами.
+# Китайские ADR с листингом в США (ALIBABA, BAIDU, JDCOM, PDD) — через US_ASSETS_ADD.
+US_ASSETS_DEFAULT = "AMD,NASD,DJ30,R2000,SPYF,UPRO,SOXQ,IBIT,ETHA,ETHAA,TLT,ARGT,IPO"
+
+
+def us_assets_from_env() -> set[str]:
+    base = os.getenv("US_ASSETS", US_ASSETS_DEFAULT)
+    extra = os.getenv("US_ASSETS_ADD", "")
+    return {x.strip().upper() for x in f"{base},{extra}".split(",") if x.strip()}
 ETF_SECIDS: set[str] = set()   # заполняется из справочника ISS (тип бумаги J)
 
 
@@ -266,6 +277,8 @@ def fmt_alert(a: Alert, html: bool = False) -> str:
     us = "🇺🇸 " if a.secid.upper() in US_PERPS else ""
     etf = "📊 " if a.secid in ETF_SECIDS else ""
     name = "вечник US" if us and a.name.upper() == a.secid.upper() else a.name
+    if us and a.name.upper() != a.secid.upper():
+        name = f"{a.name} · US"
     if etf:
         name = a.name.replace(" ETF", "") + " · фонд"
     us = us or etf
@@ -508,8 +521,9 @@ class Screener:
         self.det = PrintDetector(args.threshold, args.ref_trades, args.ref_max_age,
                                  args.cooldown, args.escalate)
         self.us = set() if os.getenv("US_PERPS_ON", "1") == "0" else set(US_PERPS)
-        us_age = float(os.getenv("US_REF_MAX_AGE", 60))
-        self.det.ref_age_override = {s: us_age for s in self.us}
+        self.us_assets = set() if not self.us else us_assets_from_env()
+        self.us_age = float(os.getenv("US_REF_MAX_AGE", 60))
+        self.det.ref_age_override = {s: self.us_age for s in self.us}
         self.only = {x.strip().upper() for x in args.only.split(",") if x.strip()}
         self.excl = {x.strip().upper() for x in args.exclude.split(",") if x.strip()}
         self.instr: dict[str, dict] = {}
@@ -553,6 +567,13 @@ class Screener:
                 self.instr = merged
                 self.instr_at = time.time()
                 for secid, info in merged.items():
+                    if (info.get("kind") == "fut" and self.us_assets
+                            and (info.get("asset") or "").upper() in self.us_assets
+                            and secid.upper() not in self.us):
+                        # квартальный фьюч на американскую акцию / индекс / ETF
+                        self.us.add(secid.upper())
+                        US_PERPS.add(secid.upper())
+                        self.det.ref_age_override[secid] = self.us_age
                     if info.get("kind") == "etf":
                         self.det.ref_age_override[secid] = self.etf_age
                         ETF_SECIDS.add(secid)
@@ -591,7 +612,7 @@ class Screener:
         fut = sum(1 for s, v in self.instr.items() if v.get("kind") == "fut" and self.allowed(s))
         us = sum(1 for s in self.instr if s.upper() in self.us and self.allowed(s))
         etf = sum(1 for s, v in self.instr.items() if v.get("kind") == "etf" and self.allowed(s))
-        return (f"принты ±{self.a.threshold}% за секунду — фьючей {fut} (из них US-вечников {us})"
+        return (f"принты ±{self.a.threshold}% за секунду — фьючей {fut} (из них американских {us})"
                 + (f", фондов {etf}" if etf else ""))
 
     def state(self) -> dict:
