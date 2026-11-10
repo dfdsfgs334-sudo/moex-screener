@@ -209,6 +209,8 @@ class Alert:
     qty: int
     side: str           # B / S
     lag_s: float
+    back: float | None = None     # цена, куда вернулось (откат подтверждён)
+    back_s: float | None = None   # за сколько секунд вернулось
 
 
 @dataclass
@@ -290,12 +292,17 @@ class PrintDetector:
             elif price < bid:
                 best = ((price / bid - 1) * 100, bid)
         else:
-            refs = (st.ref.get(side), st.sec_open.get(side))
-            for ref in refs:
-                if ref:
-                    pct = (price / ref - 1) * 100
-                    if best is None or abs(pct) > abs(best[0]):
-                        best = (pct, ref)
+            prev = next((p for t, p, _ in reversed(st.recent) if t < sec), None)
+            for ref, from_median in ((st.ref.get(side), True), (st.sec_open.get(side), False)):
+                if not ref:
+                    continue
+                pct = (price / ref - 1) * 100
+                # от медианы — только если это скачок от предыдущей сделки, а не
+                # сползание по чуть-чуть за минуту
+                if from_median and prev and abs(price / prev - 1) * 100 < self.thr / 2:
+                    continue
+                if best is None or abs(pct) > abs(best[0]):
+                    best = (pct, ref)
         if best:
             pct, ref = best
             if abs(pct) >= self.thr:
@@ -306,6 +313,86 @@ class PrintDetector:
                     hit = (d, pct, ref)
         st.recent.append((sec, price, side))
         return hit
+
+
+@dataclass
+class Pending:
+    """Прострел-кандидат: ждём объём и откат цены."""
+    secid: str
+    board: str
+    side: str
+    direction: int
+    ref: float          # рынок до прострела
+    ext: float          # самая дальняя цена прострела
+    vol: int            # лотов в прострел
+    start: float        # время первой сделки прострела (биржа)
+    can_alert: bool
+
+
+class SpikeConfirmer:
+    """Алерт только на «прострел с откатом»: ушло на ≥ порог, прошло ≥ MIN_LOTS лотов
+    и цена (сделкой или стаканом) вернулась хотя бы на REVERT_FRAC прострела
+    за REVERT_WINDOW секунд. Плавные движения и одиночные лоты отсекаются."""
+
+    def __init__(self, thr: float):
+        env = os.getenv
+        self.thr = thr
+        self.on = env("CONFIRM_REVERT", "1") != "0"
+        self.min_lots = int(env("MIN_LOTS", 2))
+        self.frac = float(env("REVERT_FRAC", 0.5))
+        self.window = float(env("REVERT_WINDOW", 60))
+        self.span = float(env("SPIKE_SPAN", 2))      # сколько секунд прострел может «добирать»
+        self.pending: dict[str, Pending] = {}
+        self.dropped = {"мало лотов": 0, "без отката": 0}
+
+    def _back_level(self, p: Pending) -> float:
+        return p.ref + (1 - self.frac) * (p.ext - p.ref)
+
+    def _confirm(self, key: str, p: Pending, back: float, ts: float):
+        self.pending.pop(key, None)
+        if p.vol < self.min_lots:
+            self.dropped["мало лотов"] += 1
+            return None
+        return p, back, max(ts - p.start, 0.0)
+
+    def _expired(self, key: str, p: Pending, ts: float) -> bool:
+        if ts - p.start > self.window:
+            self.pending.pop(key, None)
+            self.dropped["без отката"] += 1
+            return True
+        return False
+
+    def start(self, key: str, p: Pending):
+        self.pending[key] = p
+
+    def on_trade(self, key: str, ts: float, price: float, qty: int):
+        p = self.pending.get(key)
+        if not p or self._expired(key, p, ts):
+            return None
+        d = p.direction
+        beyond = (price - p.ref) * d >= p.ref * self.thr / 200   # дальше половины порога
+        if ts - p.start <= self.span and beyond and (price - p.ext) * d >= 0:
+            p.ext = price            # прострел добирает
+            p.vol += qty
+            return None
+        if ts - p.start <= self.span and beyond:
+            p.vol += qty             # ещё сделки в зоне прострела
+        if (price - self._back_level(p)) * d <= 0:
+            return self._confirm(key, p, price, ts)
+        return None
+
+    def on_quote(self, key: str, ts: float, bid: float, ask: float):
+        p = self.pending.get(key)
+        if not p or self._expired(key, p, ts):
+            return None
+        if ts < p.start + 1:          # стакан той же секунды может быть ещё «до» прострела
+            return None
+        level = self._back_level(p)
+        if p.direction > 0 and ask and ask <= level:
+            return self._confirm(key, p, ask, ts)
+        if p.direction < 0 and bid and bid >= level:
+            return self._confirm(key, p, bid, ts)
+        return None
 
 
 # ─────────────────────────── уведомления ───────────────────────────
@@ -329,6 +416,12 @@ def fmt_alert(a: Alert, html: bool = False) -> str:
     if etf:
         name = a.name.replace(" ETF", "") + " · фонд"
     us = us or etf
+    if a.back is not None:
+        bs = f"{a.back_s:.0f} с" if a.back_s and a.back_s >= 1 else "<1 с"
+        return (f"⚡{arrow} {us}{b(a.secid)} ({esc(name)}) прострел {a.pct:+.2f}%, откат за {bs}\n"
+                f"{fmt_price(a.ref)} → {fmt_price(a.price)} → {fmt_price(a.back)} | "
+                f"{a.qty} лот, {side}\n"
+                f"биржа {a.exch_time} ({lag})")
     return (f"{arrow} {us}{b(a.secid)} ({esc(name)}) принт {a.pct:+.2f}% за секунду\n"
             f"{fmt_price(a.ref)} → {fmt_price(a.price)} | {a.qty} лот, {side}\n"
             f"биржа {a.exch_time} ({lag})")
@@ -567,6 +660,7 @@ class Screener:
         self.notifier = notifier
         self.det = PrintDetector(args.threshold, args.ref_trades, args.ref_max_age,
                                  args.cooldown, args.escalate)
+        self.conf = SpikeConfirmer(args.threshold)
         self.us = set() if os.getenv("US_PERPS_ON", "1") == "0" else set(US_PERPS)
         self.us_assets = set() if not self.us else us_assets_from_env()
         self.us_age = float(os.getenv("US_REF_MAX_AGE", 60))
@@ -629,24 +723,48 @@ class Screener:
     def handle_trade(self, secid: str, ts: float, price: float, qty: int, side: str,
                      can_alert: bool = True, key: str | None = None, board: str = ""):
         """Общая обработка сделки для любого источника (ISS или Finam)."""
+        key = key or secid
         self.last_exch = datetime.fromtimestamp(ts, MSK).strftime("%H:%M:%S")
-        hit = self.det.on_trade(key or secid, ts, price, side)
-        if hit and can_alert and self.allowed(secid):
-            d, pct, ref = hit
-            name = self.instr.get(secid, {}).get("name", secid)
-            cur = {"TQTY": "¥", "TQTD": "$", "TQTE": "€", "TQTH": "HK$"}.get(board)
-            if cur:
-                name = f"{name} {cur}"
-            a = Alert(self.last_exch, datetime.now(), secid, name, d, pct, price,
-                      ref, qty, side, time.time() - ts)
-            with self.lock:
-                self.alerts.appendleft(a)
-            log(fmt_alert(a).replace("\n", " | "))
-            self.notifier.send(a)
+        done = self.conf.on_trade(key, ts, price, qty) if self.conf.on else None
+        if done:
+            self._emit(*done)
+        hit = self.det.on_trade(key, ts, price, side)
+        if not hit:
+            return
+        d, pct, ref = hit
+        if not self.conf.on:
+            if can_alert and self.allowed(secid) and qty >= self.conf.min_lots:
+                self._emit(Pending(secid, board, side, d, ref, price, qty, ts, True), None, None)
+            return
+        p = self.conf.pending.get(key)
+        if p and p.direction == d:
+            return  # уже следим за этим прострелом
+        self.conf.start(key, Pending(secid, board, side, d, ref, price, qty, ts,
+                                     can_alert and self.allowed(secid)))
+
+    def _emit(self, p: Pending, back: float | None, back_s: float | None):
+        if not p.can_alert:
+            return
+        name = self.instr.get(p.secid, {}).get("name", p.secid)
+        cur = {"TQTY": "¥", "TQTD": "$", "TQTE": "€", "TQTH": "HK$"}.get(p.board)
+        if cur:
+            name = f"{name} {cur}"
+        pct = (p.ext / p.ref - 1) * 100
+        a = Alert(datetime.fromtimestamp(p.start, MSK).strftime("%H:%M:%S"), datetime.now(),
+                  p.secid, name, p.direction, pct, p.ext, p.ref, p.vol, p.side,
+                  time.time() - p.start, back, back_s)
+        with self.lock:
+            self.alerts.appendleft(a)
+        log(fmt_alert(a).replace("\n", " | "))
+        self.notifier.send(a)
 
     def on_quote(self, secid: str, ts: float, bid: float, ask: float):
         self.det.on_quote(secid, ts, bid, ask)
         self.quotes += 1
+        if self.conf.on:
+            done = self.conf.on_quote(secid, ts, bid, ask)
+            if done:
+                self._emit(*done)
 
     def tick(self) -> bool:
         """Один опрос всех лент. True — где-то есть ещё данные, опросить сразу."""
@@ -676,7 +794,8 @@ class Screener:
                   ("сделок обработано", f"{self.processed:,}".replace(",", " ")),
                   ("сделок/мин", str(per_min)), ("порог", f"±{self.a.threshold}%"),
                   ("Telegram", "вкл" if self.notifier.enabled else "выкл"),
-                  ("прострелов", str(len(alerts)))]
+                  ("прострелов", str(len(alerts))),
+                  ("отсеяно", ", ".join(f"{k}: {v}" for k, v in self.conf.dropped.items()))]
         if self.last_err:
             status.append(("ошибка", self.last_err))
         return {"threshold": self.a.threshold, "status": status,
