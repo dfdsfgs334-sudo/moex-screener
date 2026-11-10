@@ -86,6 +86,10 @@ class FinamFeed:
         self.errors: dict[str, str] = {}
         self.limiter = OpenLimiter(float(os.getenv("FINAM_OPENS_PER_MIN", 90)))
         self.live: set[str] = set()             # стримы, по которым пришли данные
+        self.quoted: set[str] = set()           # тикеры с подпиской на стакан (бид/аск)
+        self.quote_tasks: list[asyncio.Task] = []
+        self.quote_chunk = int(os.getenv("FINAM_QUOTE_CHUNK", 50))
+        self.quotes_on = os.getenv("FINAM_QUOTES", "1") != "0"
         self.rl_hits = 0                        # упёрлись в лимит с прошлой сводки
 
     # --- запуск ---
@@ -110,9 +114,11 @@ class FinamFeed:
                 self.scr.last_err = f"Finam: {type(e).__name__}"
                 log(f"[finam] ошибка подключения: {type(e).__name__}: {str(e)[:300]}; "
                     f"повтор через {backoff}с")
-                for t in self.tasks.values():
+                for t in [*self.tasks.values(), *self.quote_tasks]:
                     t.cancel()
                 self.tasks.clear()
+                self.quote_tasks.clear()
+                self.quoted.clear()
                 await asyncio.sleep(backoff)
                 backoff = min(backoff * 2, 120)
 
@@ -196,7 +202,18 @@ class FinamFeed:
             if time.time() - last_refresh > 600 or not self.tasks:
                 last_refresh = time.time()
                 await asyncio.to_thread(self.scr.refresh_instruments)
-                new = [s for s in self._wanted() if s not in self.tasks]
+                wanted = self._wanted()
+                # сначала стакан (бид/аск) — по нему отличаем прострел от сделки по краю спреда
+                if self.quotes_on:
+                    new_q = [s for s in wanted if s not in self.quoted]
+                    for i in range(0, len(new_q), self.quote_chunk):
+                        chunk = new_q[i:i + self.quote_chunk]
+                        self.quoted.update(chunk)
+                        self.quote_tasks.append(asyncio.create_task(self._quote_stream(client, chunk)))
+                    if new_q:
+                        log(f"[finam] стакан (бид/аск): {len(self.quoted)} тикеров, "
+                            f"{len(self.quote_tasks)} потоков")
+                new = [s for s in wanted if s not in self.tasks]
                 for secid in new:
                     self.tasks[secid] = asyncio.create_task(self._stream(client, secid))
                 if new:
@@ -208,16 +225,49 @@ class FinamFeed:
             if self.rl_hits:
                 log(f"[finam] лимит запросов: {self.rl_hits} отказов за минуту, открываю медленнее")
                 self.rl_hits = 0
-            summary = (len(self.tasks), len(self.live))
+            summary = (len(self.tasks), len(self.live), self.scr.quotes > 0)
             if summary != getattr(self, "_last_summary", None):
                 self._last_summary = summary
-                log(f"[finam] стримов: {summary[0]}, с данными: {summary[1]}")
+                log(f"[finam] стримов: {summary[0]}, с данными: {summary[1]}, "
+                    f"котировок получено: {self.scr.quotes}")
             self.scr.source = (f"Finam, реальное время, {len(self.live)}/{len(self.tasks)} "
                                f"фьючей подключено")
             done = [s for s, t in self.tasks.items() if t.done()]
             for s in done:
                 self.tasks.pop(s, None)
             await asyncio.sleep(60)
+
+    # --- стакан: один поток на пачку тикеров ---
+    async def _quote_stream(self, client, secids: list[str]):
+        from finam_trade_api.market_data import SubscribeQuoteRequest
+
+        rev = {self._symbol(s): s for s in secids}
+        backoff = 2
+        while True:
+            try:
+                req = SubscribeQuoteRequest(symbols=list(rev))
+                async for resp in client.market_data.SubscribeQuote(req):
+                    err = getattr(resp, "error", None)
+                    if err is not None and getattr(err, "code", 0):
+                        log(f"[finam] стакан: ошибка {err.code}: {getattr(err, 'description', '')}")
+                    for q in resp.quote:
+                        secid = rev.get(q.symbol)
+                        if not secid:
+                            continue
+                        ts = q.timestamp.seconds + q.timestamp.nanos / 1e9 \
+                            if getattr(q.timestamp, "seconds", 0) else time.time()
+                        self.scr.on_quote(secid, ts, _dec(q.bid), _dec(q.ask))
+                    backoff = 2
+            except asyncio.CancelledError:
+                raise
+            except Exception as e:
+                if _is_rate_limit(e):
+                    self.rl_hits += 1
+                    self.limiter.pause(20)
+                else:
+                    log(f"[finam] стакан: поток прервался ({_short(e)}), переподключаюсь")
+                await asyncio.sleep(backoff * random.uniform(0.5, 1.5))
+                backoff = min(backoff * 2, 60)
 
     # --- один стрим ---
     async def _stream(self, client, secid: str):

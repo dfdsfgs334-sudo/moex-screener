@@ -213,14 +213,25 @@ class Alert:
 
 @dataclass
 class SecState:
-    recent: deque = field(default_factory=lambda: deque(maxlen=50))   # (ts, price)
+    recent: deque = field(default_factory=lambda: deque(maxlen=50))   # (ts, price, side)
     cur_sec: float = -1
-    ref: float | None = None          # медиана рынка до текущей секунды
-    sec_open: float | None = None     # первая сделка текущей секунды
+    ref: dict = field(default_factory=dict)        # side -> медиана сделок до этой секунды
+    sec_open: dict = field(default_factory=dict)   # side -> первая сделка этой секунды
+    book: deque = field(default_factory=lambda: deque(maxlen=64))     # (ts, bid, ask)
     last_alert: dict = field(default_factory=dict)                    # dir -> (ts, pct)
 
 
 class PrintDetector:
+    """Прострел = принт, ушедший на >= thr % за пределы рынка.
+
+    Со стаканом (котировки Финама): рынок = лучший бид/аск ДО секунды сделки.
+      Принт внутри спреда или по биду/аску — не прострел (это и был спам на
+      широких спредах); выше аска — % от аска, ниже бида — % от бида.
+    Без стакана (ISS): покупки сравниваются с недавними покупками, продажи —
+      с продажами (медиана за REF_MAX_AGE + первая сделка той же стороны в этой
+      секунде), чтобы «пинг-понг» бид↔аск не выглядел прострелом.
+    """
+
     def __init__(self, threshold: float, ref_trades: int, ref_max_age: float,
                  cooldown: float, escalate: float):
         self.thr = threshold
@@ -231,24 +242,60 @@ class PrintDetector:
         self.ref_age_override: dict[str, float] = {}   # свой REF_MAX_AGE для тикера
         self.state: dict[str, SecState] = {}
 
-    def on_trade(self, secid: str, ts: float, price: float) -> tuple[int, float, float] | None:
+    # --- стакан ---
+    def on_quote(self, key: str, ts: float, bid: float, ask: float):
+        st = self.state.setdefault(key, SecState())
+        if st.book:  # частичные обновления: пустое поле = без изменений
+            _, pb, pa = st.book[-1]
+            bid = bid or pb
+            ask = ask or pa
+        if bid or ask:
+            st.book.append((ts, bid, ask))
+
+    @staticmethod
+    def _book_before(st: SecState, sec: float):
+        """Последний стакан строго до секунды сделки (во время прострела стакан
+        двигается, и котировка «после» может прийти раньше самой сделки)."""
+        for t, bid, ask in reversed(st.book):
+            if t < sec:
+                return bid, ask
+        return None
+
+    # --- сделки ---
+    def on_trade(self, secid: str, ts: float, price: float, side: str = "",
+                 ) -> tuple[int, float, float] | None:
         """Возвращает (direction, pct, ref), если сделка — прострел."""
+        side = side if side in ("B", "S") else ""
         st = self.state.setdefault(secid, SecState())
+        sec = float(int(ts))
         hit = None
-        if ts != st.cur_sec:
-            # новая секунда: рынок = медиана последних N сделок за REF_MAX_AGE секунд до неё
-            st.cur_sec = ts
-            st.sec_open = price
+        if sec != st.cur_sec:
+            st.cur_sec = sec
+            st.sec_open = {}
             max_age = self.ref_age_override.get(secid.split(":")[0], self.ref_max_age)
-            last = [p for t, p in list(st.recent)[-self.ref_n:] if ts - t <= max_age]
-            st.ref = statistics.median(last) if last else None
-        # кандидаты на «рынок»: медиана до этой секунды и первая сделка этой секунды
+            fresh = [(p, sd) for t, p, sd in st.recent if sec - t <= max_age]
+            st.ref = {}
+            for sd in ("B", "S", ""):
+                ps = [p for p, x in fresh if (x == sd or sd == "")][-self.ref_n:]
+                if ps:
+                    st.ref[sd] = statistics.median(ps)
+        st.sec_open.setdefault(side, price)
+
         best = None
-        for ref in (st.ref, st.sec_open):
-            if ref:
-                pct = (price / ref - 1) * 100
-                if best is None or abs(pct) > abs(best[0]):
-                    best = (pct, ref)
+        book = self._book_before(st, sec)
+        if book and book[0] > 0 and book[1] > 0 and book[1] >= book[0]:
+            bid, ask = book
+            if price > ask:
+                best = ((price / ask - 1) * 100, ask)
+            elif price < bid:
+                best = ((price / bid - 1) * 100, bid)
+        else:
+            refs = (st.ref.get(side), st.sec_open.get(side))
+            for ref in refs:
+                if ref:
+                    pct = (price / ref - 1) * 100
+                    if best is None or abs(pct) > abs(best[0]):
+                        best = (pct, ref)
         if best:
             pct, ref = best
             if abs(pct) >= self.thr:
@@ -257,7 +304,7 @@ class PrintDetector:
                 if not prev or ts - prev[0] >= self.cooldown or abs(pct) >= abs(prev[1]) + self.escalate:
                     st.last_alert[d] = (ts, pct)
                     hit = (d, pct, ref)
-        st.recent.append((ts, price))
+        st.recent.append((sec, price, side))
         return hit
 
 
@@ -530,6 +577,7 @@ class Screener:
         self.instr_at = 0.0
         self.alerts: deque[Alert] = deque(maxlen=300)
         self.processed = 0
+        self.quotes = 0
         self.rate = deque(maxlen=600)      # (time, trades) для сделок/мин
         self.last_exch = "—"
         self.last_err = ""
@@ -582,7 +630,7 @@ class Screener:
                      can_alert: bool = True, key: str | None = None, board: str = ""):
         """Общая обработка сделки для любого источника (ISS или Finam)."""
         self.last_exch = datetime.fromtimestamp(ts, MSK).strftime("%H:%M:%S")
-        hit = self.det.on_trade(key or secid, ts, price)
+        hit = self.det.on_trade(key or secid, ts, price, side)
         if hit and can_alert and self.allowed(secid):
             d, pct, ref = hit
             name = self.instr.get(secid, {}).get("name", secid)
@@ -595,6 +643,10 @@ class Screener:
                 self.alerts.appendleft(a)
             log(fmt_alert(a).replace("\n", " | "))
             self.notifier.send(a)
+
+    def on_quote(self, secid: str, ts: float, bid: float, ask: float):
+        self.det.on_quote(secid, ts, bid, ask)
+        self.quotes += 1
 
     def tick(self) -> bool:
         """Один опрос всех лент. True — где-то есть ещё данные, опросить сразу."""
