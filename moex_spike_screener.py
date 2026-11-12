@@ -210,7 +210,8 @@ class Alert:
     side: str           # B / S
     lag_s: float
     back: float | None = None     # цена, куда вернулось (откат подтверждён)
-    back_s: float | None = None   # за сколько секунд вернулось
+    back_s: float | None = None   # за сколько секунд вернулось (от пика)
+    rise_s: float | None = None   # за сколько секунд выстрелило (от начала до пика)
 
 
 @dataclass
@@ -220,6 +221,7 @@ class SecState:
     ref: dict = field(default_factory=dict)        # side -> медиана сделок до этой секунды
     sec_open: dict = field(default_factory=dict)   # side -> первая сделка этой секунды
     book: deque = field(default_factory=lambda: deque(maxlen=64))     # (ts, bid, ask)
+    win: dict = field(default_factory=dict)        # side -> deque[(sec, price)] за SPIKE_WINDOW
     last_alert: dict = field(default_factory=dict)                    # dir -> (ts, pct)
 
 
@@ -243,6 +245,21 @@ class PrintDetector:
         self.escalate = escalate
         self.ref_age_override: dict[str, float] = {}   # свой REF_MAX_AGE для тикера
         self.state: dict[str, SecState] = {}
+        # прострел может разгоняться ступеньками за десятки секунд (шпилька на минутке)
+        self.window = float(os.getenv("SPIKE_WINDOW", 30))
+
+    def _window_base(self, st: SecState, sec: float, side: str, up: bool):
+        """Уровень ДО разгона: для движения вверх — минимум покупок и аска за окно,
+        вниз — максимум продаж и бида. Сравнение со своей стороной, чтобы
+        пинг-понг бид↔аск не давал ложных сигналов."""
+        lo = sec - self.window
+        vals = []
+        for sd in ([side] if side else ["B", "S", ""]):
+            vals += [p for t, p in st.win.get(sd, ()) if lo <= t < sec]
+        vals += [(a if up else b) for t, b, a in st.book if lo <= t < sec and (a if up else b) > 0]
+        if not vals:
+            return None
+        return min(vals) if up else max(vals)
 
     # --- стакан ---
     def on_quote(self, key: str, ts: float, bid: float, ask: float):
@@ -303,6 +320,23 @@ class PrintDetector:
                     continue
                 if best is None or abs(pct) > abs(best[0]):
                     best = (pct, ref)
+        # разгон за окно: от уровня до начала движения
+        if side in ("B", ""):
+            base = self._window_base(st, sec, side, up=True)
+            if base and price > base:
+                pct = (price / base - 1) * 100
+                if best is None or pct > abs(best[0]):
+                    best = (pct, base)
+        if side in ("S", ""):
+            base = self._window_base(st, sec, side, up=False)
+            if base and price < base:
+                pct = (price / base - 1) * 100
+                if best is None or -pct > abs(best[0]):
+                    best = (pct, base)
+        dq = st.win.setdefault(side, deque())
+        dq.append((sec, price))
+        while dq and sec - dq[0][0] > self.window:
+            dq.popleft()
         if best:
             pct, ref = best
             if abs(pct) >= self.thr:
@@ -327,7 +361,7 @@ class Pending:
     vol: int            # лотов в прострел
     start: float        # время первой сделки прострела (биржа)
     can_alert: bool
-
+    ext_ts: float = 0.0 # когда достигнут пик
 
 class SpikeConfirmer:
     """Алерт только на «прострел с откатом»: ушло на ≥ порог, прошло ≥ MIN_LOTS лотов
@@ -341,7 +375,7 @@ class SpikeConfirmer:
         self.min_lots = int(env("MIN_LOTS", 2))
         self.frac = float(env("REVERT_FRAC", 0.5))
         self.window = float(env("REVERT_WINDOW", 60))
-        self.span = float(env("SPIKE_SPAN", 2))      # сколько секунд прострел может «добирать»
+        self.max_dur = float(env("SPIKE_MAX_DURATION", 300))  # прострел целиком, сек
         self.pending: dict[str, Pending] = {}
         self.dropped = {"мало лотов": 0, "без отката": 0}
 
@@ -352,17 +386,29 @@ class SpikeConfirmer:
         self.pending.pop(key, None)
         if p.vol < self.min_lots:
             self.dropped["мало лотов"] += 1
+            self._log_drop(p, f"мало лотов ({p.vol} < {self.min_lots})")
             return None
-        return p, back, max(ts - p.start, 0.0)
+        return p, back, max(ts - (p.ext_ts or p.start), 0.0)
 
     def _expired(self, key: str, p: Pending, ts: float) -> bool:
-        if ts - p.start > self.window:
+        # REVERT_WINDOW секунд на откат — от пика; плюс общий потолок длительности
+        if ts - (p.ext_ts or p.start) > self.window or ts - p.start > self.max_dur:
             self.pending.pop(key, None)
             self.dropped["без отката"] += 1
+            self._log_drop(p, f"не вернулось за {self.window:.0f} с")
             return True
         return False
 
+    @staticmethod
+    def _log_drop(p: Pending, why: str):
+        if p.can_alert:
+            pct = (p.ext / p.ref - 1) * 100
+            t = datetime.fromtimestamp(p.start, timezone(timedelta(hours=3))).strftime("%H:%M:%S")
+            log(f"[отсеян] {p.secid} {pct:+.2f}% {fmt_price(p.ref)}→{fmt_price(p.ext)}, "
+                f"{p.vol} лот, биржа {t}: {why}")
+
     def start(self, key: str, p: Pending):
+        p.ext_ts = p.ext_ts or p.start
         self.pending[key] = p
 
     def on_trade(self, key: str, ts: float, price: float, qty: int):
@@ -371,12 +417,11 @@ class SpikeConfirmer:
             return None
         d = p.direction
         beyond = (price - p.ref) * d >= p.ref * self.thr / 200   # дальше половины порога
-        if ts - p.start <= self.span and beyond and (price - p.ext) * d >= 0:
-            p.ext = price            # прострел добирает
-            p.vol += qty
+        if beyond:
+            p.vol += qty             # сделки в зоне прострела
+        if (price - p.ext) * d > 0:
+            p.ext, p.ext_ts = price, ts   # прострел добирает — пик выше
             return None
-        if ts - p.start <= self.span and beyond:
-            p.vol += qty             # ещё сделки в зоне прострела
         if (price - self._back_level(p)) * d <= 0:
             return self._confirm(key, p, price, ts)
         return None
@@ -417,8 +462,9 @@ def fmt_alert(a: Alert, html: bool = False) -> str:
         name = a.name.replace(" ETF", "") + " · фонд"
     us = us or etf
     if a.back is not None:
-        bs = f"{a.back_s:.0f} с" if a.back_s and a.back_s >= 1 else "<1 с"
-        return (f"⚡{arrow} {us}{b(a.secid)} ({esc(name)}) прострел {a.pct:+.2f}%, откат за {bs}\n"
+        sec = lambda v: f"{v:.0f} с" if v and v >= 1 else "<1 с"
+        return (f"⚡{arrow} {us}{b(a.secid)} ({esc(name)}) прострел {a.pct:+.2f}% "
+                f"за {sec(a.rise_s)}, откат за {sec(a.back_s)}\n"
                 f"{fmt_price(a.ref)} → {fmt_price(a.price)} → {fmt_price(a.back)} | "
                 f"{a.qty} лот, {side}\n"
                 f"биржа {a.exch_time} ({lag})")
@@ -736,9 +782,8 @@ class Screener:
             if can_alert and self.allowed(secid) and qty >= self.conf.min_lots:
                 self._emit(Pending(secid, board, side, d, ref, price, qty, ts, True), None, None)
             return
-        p = self.conf.pending.get(key)
-        if p and p.direction == d:
-            return  # уже следим за этим прострелом
+        if self.conf.pending.get(key):
+            return  # уже следим за прострелом; движение назад — это его откат, не новый
         self.conf.start(key, Pending(secid, board, side, d, ref, price, qty, ts,
                                      can_alert and self.allowed(secid)))
 
@@ -752,7 +797,7 @@ class Screener:
         pct = (p.ext / p.ref - 1) * 100
         a = Alert(datetime.fromtimestamp(p.start, MSK).strftime("%H:%M:%S"), datetime.now(),
                   p.secid, name, p.direction, pct, p.ext, p.ref, p.vol, p.side,
-                  time.time() - p.start, back, back_s)
+                  time.time() - p.start, back, back_s, max((p.ext_ts or p.start) - p.start, 0.0))
         with self.lock:
             self.alerts.appendleft(a)
         log(fmt_alert(a).replace("\n", " | "))
