@@ -257,6 +257,10 @@ class FinamFeed:
                         ts = q.timestamp.seconds + q.timestamp.nanos / 1e9 \
                             if getattr(q.timestamp, "seconds", 0) else time.time()
                         self.scr.on_quote(secid, ts, _dec(q.bid), _dec(q.ask))
+                        if not getattr(q, "is_data_snapshot", False) and getattr(self, "_skew_n", 0) < 3:
+                            self._skew_n = getattr(self, "_skew_n", 0) + 1
+                            log(f"[finam] стакан {q.symbol}: время котировки отличается "
+                                f"от реального на {ts - time.time():+.1f} с")
                     backoff = 2
             except asyncio.CancelledError:
                 raise

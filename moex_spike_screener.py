@@ -246,15 +246,16 @@ class PrintDetector:
         self.ref_age_override: dict[str, float] = {}   # свой REF_MAX_AGE для тикера
         self.state: dict[str, SecState] = {}
         # прострел может разгоняться ступеньками за десятки секунд (шпилька на минутке)
-        self.window = float(os.getenv("SPIKE_WINDOW", 30))
+        self.window = float(os.getenv("SPIKE_WINDOW", 2))
 
-    def _window_base(self, st: SecState, sec: float, side: str, up: bool):
+    def _window_base(self, st: SecState, sec: float, side: str, up: bool,
+                     all_sides: bool = False):
         """Уровень ДО разгона: для движения вверх — минимум покупок и аска за окно,
         вниз — максимум продаж и бида. Сравнение со своей стороной, чтобы
         пинг-понг бид↔аск не давал ложных сигналов."""
         lo = sec - self.window
         vals = []
-        for sd in ([side] if side else ["B", "S", ""]):
+        for sd in ([side] if side and not all_sides else ["B", "S", ""]):
             vals += [p for t, p in st.win.get(sd, ()) if lo <= t < sec]
         vals += [(a if up else b) for t, b, a in st.book if lo <= t < sec and (a if up else b) > 0]
         if not vals:
@@ -302,6 +303,18 @@ class PrintDetector:
 
         best = None
         book = self._book_before(st, sec)
+        # стакан должен сходиться с последними сделками; если он дальше порога от них,
+        # это уже стакан «после» прострела, пришедший раньше сделок — не используем
+        prev_tr = next((p for t, p, _ in reversed(st.recent) if t < sec and sec - t <= 60), None)
+        if book and prev_tr and book[0] > 0 and book[1] > 0:
+            lo_ok = book[0] * (1 - self.thr / 100)
+            hi_ok = book[1] * (1 + self.thr / 100)
+            if not (lo_ok <= prev_tr <= hi_ok):
+                book = None
+        # узкий спред: сравнивать можно и со сделками другой стороны — тогда прострел
+        # ловится, даже если стакан «после» пришёл с меткой времени раньше сделки
+        narrow = bool(book and book[0] > 0 and book[1] >= book[0]
+                      and (book[1] / book[0] - 1) * 100 < self.thr / 2)
         if book and book[0] > 0 and book[1] > 0 and book[1] >= book[0]:
             bid, ask = book
             if price > ask:
@@ -322,13 +335,13 @@ class PrintDetector:
                     best = (pct, ref)
         # разгон за окно: от уровня до начала движения
         if side in ("B", ""):
-            base = self._window_base(st, sec, side, up=True)
+            base = self._window_base(st, sec, side, up=True, all_sides=narrow)
             if base and price > base:
                 pct = (price / base - 1) * 100
                 if best is None or pct > abs(best[0]):
                     best = (pct, base)
         if side in ("S", ""):
-            base = self._window_base(st, sec, side, up=False)
+            base = self._window_base(st, sec, side, up=False, all_sides=narrow)
             if base and price < base:
                 pct = (price / base - 1) * 100
                 if best is None or -pct > abs(best[0]):
@@ -374,7 +387,7 @@ class SpikeConfirmer:
         self.on = env("CONFIRM_REVERT", "1") != "0"
         self.min_lots = int(env("MIN_LOTS", 2))
         self.frac = float(env("REVERT_FRAC", 0.5))
-        self.window = float(env("REVERT_WINDOW", 60))
+        self.window = float(env("REVERT_WINDOW", 20))
         self.max_dur = float(env("SPIKE_MAX_DURATION", 300))  # прострел целиком, сек
         self.pending: dict[str, Pending] = {}
         self.dropped = {"мало лотов": 0, "без отката": 0}
