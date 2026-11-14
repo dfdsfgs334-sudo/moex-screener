@@ -132,7 +132,7 @@ class BotHub:
         if cmd == "/start":
             with self.lock:
                 new = cid not in self.subs
-                self.subs.setdefault(cid, {"thr": self.min_thr, "name": name})
+                self.subs.setdefault(cid, {"name": name})   # порог — общий, пока не задан /porog
                 self.dirty |= new
             self.send(cid, ("✅ Подписка оформлена.\n\n" if new else "Ты уже подписан(а).\n\n")
                       + HELP.format(thr=thr0))
@@ -151,13 +151,15 @@ class BotHub:
                 return
             v = max(v, self.min_thr)
             with self.lock:
-                self.subs.setdefault(cid, {"name": name})["thr"] = v
+                sub = self.subs.setdefault(cid, {"name": name})
+                sub["thr"], sub["custom"] = v, True
                 self.dirty = True
             self.send(cid, f"Ок, присылаю прострелы от ±{v:g}%")
         elif cmd == "/status":
             with self.lock:
                 me = self.subs.get(cid)
-            mine = f"подписка: ✅, порог ±{me['thr']:g}%" if me else "подписка: ❌ (/start)"
+            mine = (f"подписка: ✅, порог ±{self.user_thr(me):g}%"
+                    + ("" if me.get("custom") else " (общий)")) if me else "подписка: ❌ (/start)"
             self.send(cid, f"{mine}\n{self.status_fn()}")
         else:
             self.send(cid, HELP.format(thr=thr0))
@@ -198,10 +200,16 @@ class BotHub:
         self.load()
         threading.Thread(target=self.poll_forever, daemon=True, name="tg-bot").start()
 
+    def user_thr(self, sub: dict) -> float:
+        """Свой порог — только если задан через /porog; иначе общий THRESHOLD."""
+        if sub.get("custom"):
+            return max(float(sub.get("thr", self.min_thr)), self.min_thr)
+        return self.min_thr
+
     # ───────── рассылка ─────────
     def broadcast(self, text: str, pct: float, skip: set[str] = frozenset()):
         with self.lock:
-            targets = [(c, v.get("thr", self.min_thr)) for c, v in self.subs.items()]
+            targets = [(c, self.user_thr(v)) for c, v in self.subs.items()]
         gone = []
         for chat, thr in targets:
             if chat in skip or abs(pct) < thr:

@@ -12,6 +12,6 @@ services:
       - key: FINAM_SECRET
         sync: false
       - key: THRESHOLD
-        value: "2"
+        value: "1.5"
       - key: MIN_TRADES
         value: "30"
