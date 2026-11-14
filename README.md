@@ -1,6 +1,16 @@
+---
+title: MOEX Spike Screener
+emoji: ⚡
+colorFrom: green
+colorTo: red
+sdk: docker
+app_port: 8080
+pinned: false
+---
+
 # MOEX FORTS — скринер секундных прострелов
 
-Читает полную ленту сделок срочного рынка Мосбиржи и шлёт алерт в Telegram на каждый **принт, улетевший на ±2% и больше за секунду**.
+Читает полную ленту сделок срочного рынка Мосбиржи и шлёт алерт в Telegram на каждый **прострел на ±1.2% и больше за секунду с быстрым откатом**.
 
 ## Что считается прострелом
 Сделка (принт), ушедшая за пределы рынка на ≥ `THRESHOLD`% (по умолчанию 1.2%).
@@ -121,6 +131,16 @@
 | `FINAM_FUT_MIC` | `RTSX` | код биржи для фьючей, если справочник Финама недоступен |
 
 При запуске в лог пишутся квоты API (`[finam] квота …`) и число найденных фьючей. Если Финам режет число подписок, уменьши `FINAM_MAX_STREAMS`.
+
+## Деплой: Hugging Face Spaces (бесплатно, без карты)
+1. Зарегистрируйся на https://huggingface.co.
+2. **New → Space**: любое имя, **Space SDK: Docker → Blank**, железо **CPU basic (free)**, видимость **Public**. Пингер должен доходить до `/health` без логина, поэтому Space нужен публичный.
+3. **Files → Add file → Upload files**: загрузи из этого репозитория `Dockerfile`, `requirements.txt`, `moex_spike_screener.py`, `finam_source.py`, `tg_bot.py` и `README.md`. В шапке README (между `---`) лежат настройки для Hugging Face.
+4. **Settings → Variables and secrets**:
+   - **New secret**: `TG_TOKEN`, `TG_CHAT_ID`, `FINAM_SECRET`;
+   - **New variable**: остальные настройки, если нужны (`THRESHOLD`, `MIN_LOTS` и т.д.).
+5. Space соберётся сам, статус станет **Running**. Логи — во вкладке **Logs**, дашборд — по адресу `https://<ник>-<имя>.hf.space`.
+6. Пингер (cron-job.org): `https://<ник>-<имя>.hf.space/health` каждые 10 минут. Без заходов Space засыпает через 48 часов.
 
 ## Деплой: Render + пингер
 1. Залей репозиторий на GitHub.
