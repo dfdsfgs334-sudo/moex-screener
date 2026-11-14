@@ -893,8 +893,8 @@ class Screener:
 def parse_args():
     env = os.getenv
     p = argparse.ArgumentParser(description="Скринер секундных прострелов по фьючам MOEX")
-    p.add_argument("-t", "--threshold", type=float, default=float(env("THRESHOLD", 1.5)),
-                   help="порог прострела в %% (по умолч. 1.5)")
+    p.add_argument("-t", "--threshold", type=float, default=float(env("THRESHOLD", 1.2)),
+                   help="порог прострела в %% (по умолч. 1.2)")
     p.add_argument("--ref-trades", type=int, default=int(env("REF_TRADES", 5)),
                    help="сколько последних сделок брать для цены рынка (медиана, по умолч. 5)")
     p.add_argument("--ref-max-age", type=float, default=float(env("REF_MAX_AGE", 10)),
