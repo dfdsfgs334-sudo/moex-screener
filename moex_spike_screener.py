@@ -677,6 +677,31 @@ def start_web(port: int, get_state):
     log(f"[web] дашборд на порту {port}")
 
 
+def start_keepalive():
+    """Бесплатный Render усыпляет сервис через 15 мин без входящих запросов —
+    сервис сам стучится на свой публичный адрес (RENDER_EXTERNAL_URL задаёт Render,
+    для другого хостинга можно задать KEEPALIVE_URL). Работает вместе с внешним пингером."""
+    url = (os.getenv("KEEPALIVE_URL") or os.getenv("RENDER_EXTERNAL_URL") or "").rstrip("/")
+    if not url or os.getenv("KEEPALIVE", "1") == "0":
+        return
+    every = float(os.getenv("KEEPALIVE_EVERY", 300))
+
+    def loop():
+        s = requests.Session()
+        fails = 0
+        while True:
+            time.sleep(every)
+            try:
+                r = s.get(f"{url}/health", timeout=20)
+                fails = 0 if r.ok else fails + 1
+            except requests.RequestException:
+                fails += 1
+            if fails in (1, 5):
+                log(f"[keepalive] не достучался до {url}/health ({fails} раз подряд)")
+    threading.Thread(target=loop, daemon=True, name="keepalive").start()
+    log(f"[keepalive] сам себя бужу: {url}/health каждые {every:.0f} с")
+
+
 # ─────────────────────────── основной цикл ───────────────────────────
 
 MSK = timezone(timedelta(hours=3))  # время биржи — Москва (без перехода на летнее)
@@ -1010,6 +1035,7 @@ def main():
         log("[bot] публичный бот включён: любой может написать боту /start")
     if os.getenv("PORT"):
         start_web(int(os.getenv("PORT")), scr.state)
+    start_keepalive()
     secret = (os.getenv("FINAM_SECRET") or "").strip()
     try:
         if secret:

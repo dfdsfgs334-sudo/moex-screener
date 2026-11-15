@@ -229,8 +229,11 @@ class FinamFeed:
                 log(f"[finam] лимит запросов: {self.rl_hits} отказов за минуту, открываю медленнее")
                 self.rl_hits = 0
             summary = (len(self.tasks), len(self.live), self.scr.quotes > 0)
-            if summary != getattr(self, "_last_summary", None):
+            # пульс раз в 10 минут даже без изменений: дыра в логе = сервис спал
+            if (summary != getattr(self, "_last_summary", None)
+                    or time.time() - getattr(self, "_last_pulse", 0) > 600):
                 self._last_summary = summary
+                self._last_pulse = time.time()
                 log(f"[finam] стримов: {summary[0]}, с данными: {summary[1]}, "
                     f"котировок получено: {self.scr.quotes}")
             self.scr.source = (f"Finam, реальное время, {len(self.live)}/{len(self.tasks)} "
