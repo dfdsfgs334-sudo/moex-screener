@@ -387,7 +387,7 @@ class SpikeConfirmer:
         self.on = env("CONFIRM_REVERT", "1") != "0"
         self.min_lots = int(env("MIN_LOTS", 2))
         self.frac = float(env("REVERT_FRAC", 0.5))
-        self.window = float(env("REVERT_WINDOW", 20))
+        self.window = float(env("REVERT_WINDOW", 5))
         self.max_dur = float(env("SPIKE_MAX_DURATION", 300))  # прострел целиком, сек
         self.pending: dict[str, Pending] = {}
         self.dropped = {"мало лотов": 0, "без отката": 0}
