@@ -225,6 +225,8 @@ class SecState:
     book: deque = field(default_factory=lambda: deque(maxlen=64))     # (ts, bid, ask)
     win: dict = field(default_factory=dict)        # side -> deque[(sec, price)] за SPIKE_WINDOW
     resume_ts: float = 0.0                         # первая сделка после перерыва > 10 мин
+    pre_pause: float | None = None                 # последняя цена до перерыва
+    buckets: deque = field(default_factory=lambda: deque(maxlen=400))  # (10-с бакет, lo, hi)
     last_alert: dict = field(default_factory=dict)                    # dir -> (ts, pct)
 
 
@@ -293,6 +295,13 @@ class PrintDetector:
         sec = float(int(ts))
         if not st.recent or sec - st.recent[-1][0] > 600:
             st.resume_ts = sec            # открытие сессии / торги после перерыва
+            st.pre_pause = st.recent[-1][1] if st.recent else None
+        b = int(sec // 10)
+        if st.buckets and st.buckets[-1][0] == b:
+            _, lo, hi = st.buckets[-1]
+            st.buckets[-1] = (b, min(lo, price), max(hi, price))
+        else:
+            st.buckets.append((b, price, price))
         hit = None
         if sec != st.cur_sec:
             st.cur_sec = sec
@@ -383,6 +392,7 @@ class Pending:
     back: float | None = None    # цена отката
     back_ts: float = 0.0         # когда откатилось (дальше ждём, что уровень держится)
     opening: bool = False        # первые сделки после перерыва (открытие сессии)
+    pre_pause: float | None = None
 
 class SpikeConfirmer:
     """Алерт только на иголку: ушло на ≥ порог, прошло ≥ MIN_LOTS лотов, цена вернулась
@@ -400,9 +410,45 @@ class SpikeConfirmer:
         self.hold = float(env("HOLD", 3))
         self.calm = float(env("CALM_WINDOW", 10))
         self.max_dur = float(env("SPIKE_MAX_DURATION", 300))  # прострел целиком, сек
+        self.max_rise = float(env("MAX_RISE", 2))       # от начала до пика, сек
+        self.lookback = float(env("TREND_LOOKBACK", 1800))  # окно для «отскока после движения»
         self.pending: dict[str, Pending] = {}
         self.dropped = {"мало лотов": 0, "без отката": 0, "рынок уже двигался": 0,
-                        "продолжилось после отката": 0}
+                        "продолжилось после отката": 0, "отскок после движения": 0,
+                        "медленный разгон": 0, "гэп на открытии": 0}
+
+    def bounce_after_move(self, st: "SecState", sec: float, spike_window: float,
+                          direction: int, ref: float) -> float | None:
+        """Палка вверх после пролива (или вниз после выноса): за TREND_LOOKBACK секунд
+        до прострела цена уже уходила от ref на ≥ порог в ПРОТИВОПОЛОЖНУЮ сторону.
+        Возвращает размер того движения в %, если это отскок."""
+        if self.lookback <= 0 or not ref:
+            return None
+        hi_b = int((sec - spike_window) // 10)     # бакеты до начала прострела
+        lo_b = int((sec - self.lookback) // 10)
+        ext = None
+        for b, lo, hi in st.buckets:
+            if lo_b <= b < hi_b:
+                v = hi if direction > 0 else lo
+                ext = v if ext is None else (max(ext, v) if direction > 0 else min(ext, v))
+        if ext is None:
+            return None
+        move = (ext / ref - 1) * 100 * direction    # >0: цена была выше (для вверх) / ниже (вниз)
+        return move if move >= self.thr else None
+
+    def final_check(self, p: Pending) -> str | None:
+        """Проверки перед алертом. Возвращает причину отказа или None."""
+        rise = (p.ext_ts or p.start) - p.start
+        if rise > self.max_rise:
+            self.dropped["медленный разгон"] += 1
+            return f"разгон до пика {rise:.0f} с (> {self.max_rise:.0f} с) — не иголка"
+        if p.opening and p.pre_pause:
+            gap = abs(p.ext / p.pre_pause - 1) * 100
+            if gap < self.thr:
+                self.dropped["гэп на открытии"] += 1
+                return (f"на открытии пик {fmt_price(p.ext)} у цены до перерыва "
+                        f"{fmt_price(p.pre_pause)} ({gap:.2f}%) — это гэп, не прострел")
+        return None
 
     def _back_level(self, p: Pending) -> float:
         return p.ref + (1 - self.frac) * (p.ext - p.ref)
@@ -871,7 +917,15 @@ class Screener:
         if self.conf.pending.get(key):
             return  # уже следим за прострелом; движение назад — это его откат, не новый
         p = Pending(secid, board, side, d, ref, price, qty, ts, can_alert and self.allowed(secid))
-        p.opening = float(int(ts)) - self.det.state[key].resume_ts <= 60
+        st = self.det.state[key]
+        p.opening = float(int(ts)) - st.resume_ts <= 60
+        p.pre_pause = st.pre_pause if p.opening else None
+        moved = self.conf.bounce_after_move(st, float(int(ts)), self.det.window, d, ref)
+        if moved:
+            self.conf.dropped["отскок после движения"] += 1
+            self.conf._log_drop(p, f"за {self.conf.lookback / 60:.0f} мин до этого цена уже "
+                                   f"прошла {moved:.1f}% в другую сторону — это откуп/отскок")
+            return
         if not self.conf.calm_before(self.det.state[key], float(int(ts)), self.det.window):
             self.conf.dropped["рынок уже двигался"] += 1
             self.conf._log_drop(p, f"за {self.conf.calm:.0f} с до прострела цена уже ходила "
@@ -882,6 +936,11 @@ class Screener:
     def _emit(self, p: Pending, back: float | None, back_s: float | None):
         if not p.can_alert:
             return
+        if self.conf.on:
+            why = self.conf.final_check(p)
+            if why:
+                self.conf._log_drop(p, why)
+                return
         name = self.instr.get(p.secid, {}).get("name", p.secid)
         cur = {"TQTY": "¥", "TQTD": "$", "TQTE": "€", "TQTH": "HK$"}.get(p.board)
         if cur:
