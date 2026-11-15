@@ -70,7 +70,8 @@ ETF_SECIDS: set[str] = set()   # заполняется из справочни�
 
 
 def log(msg: str):
-    print(f"{datetime.now():%H:%M:%S} {msg}", flush=True)
+    # время в логах всегда московское (как у биржи), независимо от часового пояса сервера
+    print(f"{datetime.now(timezone(timedelta(hours=3))):%H:%M:%S} {msg}", flush=True)
 
 
 # ─────────────────────────── ISS ───────────────────────────
