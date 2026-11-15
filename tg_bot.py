@@ -40,6 +40,7 @@ class BotHub:
         self.dirty = False
         self.pinned_id: int | None = None
         self.offset = 0
+        self._poll_err = ""
 
     # ───────── Telegram API ─────────
     def call(self, method: str, timeout: float = 15, files=None, **params):
@@ -165,6 +166,11 @@ class BotHub:
             self.send(cid, HELP.format(thr=thr0))
 
     def poll_forever(self):
+        me = self.call("getMe")
+        if me.get("ok"):
+            self.log(f"[bot] бот @{me['result'].get('username')} слушает команды")
+        else:
+            self.log(f"[bot] getMe: {me.get('error_code')} {me.get('description')}")
         self.call("deleteWebhook")
         self.call("setMyCommands", commands=json.dumps([
             {"command": "start", "description": "подписаться на прострелы"},
@@ -180,9 +186,20 @@ class BotHub:
                     "offset": self.offset, "timeout": 50,
                     "allowed_updates": json.dumps(["message"])}).json()
                 if not js.get("ok"):
-                    # 409 — при деплое ненадолго работают две копии; ждём, пока старая умрёт
+                    # 409 — бот опрашивается в другом месте (вторая копия скринера,
+                    # при деплое — ненадолго старая); 401 — неверный токен
+                    err = f"{js.get('error_code')} {js.get('description')}"
+                    if err != self._poll_err:
+                        self._poll_err = err
+                        hint = {409: " — работает ещё одна копия бота (другой сервер или "
+                                     "второй сервис); останови лишнюю",
+                                401: " — неверный TG_TOKEN"}.get(js.get("error_code"), "")
+                        self.log(f"[bot] Telegram не отдаёт сообщения: {err}{hint}")
                     time.sleep(5)
                     continue
+                if self._poll_err:
+                    self._poll_err = ""
+                    self.log("[bot] приём команд восстановлен")
                 for upd in js.get("result", []):
                     self.offset = upd["update_id"] + 1
                     if upd.get("message"):
@@ -190,7 +207,11 @@ class BotHub:
                             self.handle(upd["message"])
                         except Exception as e:
                             self.log(f"[bot] ошибка обработки команды: {e}")
-            except Exception:
+            except Exception as e:
+                err = f"{type(e).__name__}: {str(e)[:150]}"
+                if err != self._poll_err:
+                    self._poll_err = err
+                    self.log(f"[bot] ошибка приёма команд: {err}")
                 time.sleep(3)
             if time.time() - last_save > 5:
                 last_save = time.time()
